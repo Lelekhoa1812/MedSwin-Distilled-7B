@@ -1,0 +1,11 @@
+pandas
+llama-index
+transformers
+torch
+sentence-transformers
+PyPDF2
+python-docx
+llama_index.llms.huggingface
+llama_index.embeddings.huggingface
+llama-index-retrievers-bm25
+accelerate
