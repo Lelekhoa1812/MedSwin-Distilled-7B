@@ -48,7 +48,7 @@ TITLE = "<h1><center>Multi-Document RAG with LLama 3.1-8B Model</center></h1>"
 DESCRIPTION = """
 <center>
 <p>Upload PDF or text files to get started!</p>
-<p>After asking question wait for RAG system to get relevant nodes and passed to LLM</p>
+<p>After asking question wait for RAG system to get relevant nodes and pass to LLM</p>
 </center>
 """
 CSS = """
