@@ -131,6 +131,7 @@ global_model = None
 global_tokenizer = None
 global_file_info = {}
 
+
 def _normalize_text(s: str) -> str:
     s = unicodedata.normalize("NFKC", s)
     s = s.replace("\u00A0", " ")  # NBSP -> space
@@ -175,6 +176,47 @@ def _build_fallback_chat_prompt(messages):
     parts.append("Assistant:\n")  # generation cue
     return "\n".join(parts)
 
+
+def build_prompt(messages, tokenizer, system_prompt: str, context: str, source_info: str):
+    sys = system_prompt.strip()
+    if context:
+        sys = f"{sys}\n\n[Document Context]\n{context}{source_info}"
+
+    # Prefer chat template when available (chat-tuned models)
+    if hasattr(tokenizer, "apply_chat_template"):
+        try:
+            chat_msgs = [{"role": "system", "content": sys}]
+            for m in messages:
+                # Gradio `type="messages"` gives {"role": "...", "content": "..."}
+                if m.get("role") in ("user", "assistant", "system"):
+                    chat_msgs.append({"role": m["role"], "content": m.get("content","")})
+            return tokenizer.apply_chat_template(
+                chat_msgs, tokenize=False, add_generation_prompt=True
+            ), True
+        except Exception:
+            pass
+
+    # Fallback: instruct-style (works for non-chat causal LMs)
+    # Strong guardrails to avoid “As an AI…” style preambles
+    instruct = (
+        "### System\n"
+        f"{sys}\n\n"
+        "### Rules\n"
+        "- Answer directly in clinical language.\n"
+        "- Do not mention that you are an AI.\n"
+        "- Do not include meta commentary or apologies.\n"
+        "- Keep it concise and evidence-focused.\n\n"
+        "### Conversation\n"
+    )
+    for m in messages:
+        role = m.get("role","user")
+        content = (m.get("content","") or "").strip()
+        if role == "user":
+            instruct += f"User: {content}\n"
+        elif role == "assistant":
+            instruct += f"Assistant: {content}\n"
+    instruct += "Assistant: "
+    return instruct, False
 
 
 def initialize_model_and_tokenizer():
@@ -257,6 +299,7 @@ def get_llm(temperature=0.0, max_new_tokens=256, top_p=0.95, top_k=50):
         }
     )
 
+
 def extract_text_from_document(file):
     file_name = file.name
     file_extension = os.path.splitext(file_name)[1].lower()
@@ -270,6 +313,7 @@ def extract_text_from_document(file):
         return text, len(text.split()), None
     else:
         return None, 0, ValueError(f"Unsupported file format: {file_extension}")
+
 
 @spaces.GPU()
 def create_or_update_index(files, request: gr.Request):
@@ -385,6 +429,7 @@ def create_or_update_index(files, request: gr.Request):
     output_container += "</div>"
     return f"Successfully indexed {len(files)} files.", output_container
 
+
 @spaces.GPU()
 def stream_chat(
     message: str,
@@ -400,176 +445,186 @@ def stream_chat(
     merge_threshold: float,
     request: gr.Request
 ):
+    # --- guards & basics ---
     if not request:
         yield history + [{"role": "assistant", "content": "Session initialization failed. Please refresh the page."}]
         return
     user_id = request.session_hash
     index_dir = f"./{user_id}_index"
 
+    # normalize UI params
     max_new_tokens = int(max_new_tokens) if isinstance(max_new_tokens, (int, float)) else 1024
-    temperature = float(temperature) if isinstance(temperature, (int, float)) else 0.9  
-    top_p = float(top_p) if isinstance(top_p, (int, float)) else 0.95  
-    top_k = int(top_k) if isinstance(top_k, (int, float)) else 50  
-    penalty = float(penalty) if isinstance(penalty, (int, float)) else 1.2
-    retriever_k = int(retriever_k) if isinstance(retriever_k, (int, float)) else 15
-    merge_threshold = float(merge_threshold) if isinstance(merge_threshold, (int, float)) else 0.5
-    llm = get_llm(temperature=temperature, max_new_tokens=max_new_tokens, top_p=top_p, top_k=top_k)
-    Settings.llm = llm
+    temperature    = float(temperature)  if isinstance(temperature,  (int, float)) else 0.0
+    top_p          = float(top_p)        if isinstance(top_p,        (int, float)) else 0.95
+    top_k          = int(top_k)          if isinstance(top_k,        (int, float)) else 50
+    penalty        = float(penalty)      if isinstance(penalty,      (int, float)) else 1.2
+    retriever_k    = int(retriever_k)    if isinstance(retriever_k,  (int, float)) else 15
+    merge_threshold= float(merge_threshold) if isinstance(merge_threshold, (int, float)) else 0.5
+
+    # ensure model/tokenizer exist
+    if global_model is None or global_tokenizer is None:
+        initialize_model_and_tokenizer()
+
+    # --- retrieval (optional) ---
     context = ""
     source_info = ""
-    if not disable_retrieval:
-        if not os.path.exists(index_dir):
-            yield history + [{"role": "assistant", "content": "Please upload documents first or enable 'Disable document retrieval' to chat without documents."}]
-            return
-        embed_model = HuggingFaceEmbedding(model_name=EMBEDDING_MODEL, token=HF_TOKEN)
-        Settings.embed_model = embed_model
-        storage_context = StorageContext.from_defaults(persist_dir=index_dir)
-        index = load_index_from_storage(storage_context, settings=Settings)
-        base_retriever = index.as_retriever(similarity_top_k=retriever_k)
-        auto_merging_retriever = AutoMergingRetriever(
-            base_retriever,
-            storage_context=storage_context,
-            simple_ratio_thresh=merge_threshold, 
-            verbose=True
-        )
-        logger.info(f"Query: {message}")
-        retrieval_start = time.time()
-        base_nodes = base_retriever.retrieve(message)
-        logger.info(f"Retrieved {len(base_nodes)} base nodes in {time.time() - retrieval_start:.2f}s")
-        base_file_sources = {}
-        for node in base_nodes:
-            if hasattr(node.node, 'metadata') and 'file_name' in node.node.metadata:
-                file_name = node.node.metadata['file_name']
-                if file_name not in base_file_sources:
-                    base_file_sources[file_name] = 0
-                base_file_sources[file_name] += 1
-        logger.info(f"Base retrieval file distribution: {base_file_sources}")
-        merging_start = time.time()
-        merged_nodes = auto_merging_retriever.retrieve(message)
-        logger.info(f"Retrieved {len(merged_nodes)} merged nodes in {time.time() - merging_start:.2f}s")
-        merged_file_sources = {}
-        for node in merged_nodes:
-            if hasattr(node.node, 'metadata') and 'file_name' in node.node.metadata:
-                file_name = node.node.metadata['file_name']
-                if file_name not in merged_file_sources:
-                    merged_file_sources[file_name] = 0
-                merged_file_sources[file_name] += 1
-        logger.info(f"Merged retrieval file distribution: {merged_file_sources}")
-        context = "\n\n".join([n.node.text for n in merged_nodes])
-        context = _normalize_text(context)
-        context = _truncate_by_tokens(context, global_tokenizer, max_tokens=1800)
-        if merged_file_sources:
-            source_info = "\n\nRetrieved information from files: " + ", ".join(merged_file_sources.keys())
-    formatted_system_prompt = (
-        f"{system_prompt}\n\n" + ("Document Context:\n" + context + source_info if context else "")
-    )
-    messages = [{"role": "system", "content": formatted_system_prompt}]
-    for entry in history:
-        messages.append(entry)
-    messages.append({"role": "user", "content": message})
+    try:
+        if not disable_retrieval:
+            if not os.path.exists(index_dir):
+                yield history + [{"role": "assistant", "content": "Please upload documents first or enable 'Disable document retrieval' to chat without documents."}]
+                return
+
+            embed_model = HuggingFaceEmbedding(model_name=EMBEDDING_MODEL, token=HF_TOKEN)
+            Settings.embed_model = embed_model
+
+            storage_context = StorageContext.from_defaults(persist_dir=index_dir)
+            index = load_index_from_storage(storage_context, settings=Settings)
+
+            base_retriever = index.as_retriever(similarity_top_k=retriever_k)
+            auto_merging_retriever = AutoMergingRetriever(
+                base_retriever,
+                storage_context=storage_context,
+                simple_ratio_thresh=merge_threshold,
+                verbose=True
+            )
+
+            logger.info(f"[query] {message}")
+            t0 = time.time()
+            base_nodes = base_retriever.retrieve(message)
+            logger.info(f"[retrieval] base={len(base_nodes)} in {time.time()-t0:.2f}s")
+
+            t1 = time.time()
+            merged_nodes = auto_merging_retriever.retrieve(message)
+            logger.info(f"[retrieval] merged={len(merged_nodes)} in {time.time()-t1:.2f}s")
+
+            # merge text + normalize + truncate by tokens to keep headroom for generation
+            context = "\n\n".join([(n.node.text or "") for n in merged_nodes])
+            context = _normalize_text(context)
+            context = _truncate_by_tokens(context, global_tokenizer, max_tokens=1800)
+
+            # compact source list
+            srcs = []
+            for n in merged_nodes:
+                md = getattr(n.node, "metadata", {}) or {}
+                fn = md.get("file_name")
+                if fn and fn not in srcs:
+                    srcs.append(fn)
+            if srcs:
+                source_info = "\n\n[Sources] " + ", ".join(srcs)
+    except Exception as e:
+        logger.exception(f"retrieval error: {e}")
+        # fallback to no context rather than failing the chat
+        context, source_info = "", ""
+
+    # --- prompt building (template-aware) ---
+    sys_text = (system_prompt or "").strip()
+    if context:
+        sys_text = f"{sys_text}\n\n[Document Context]\n{context}{source_info}"
+
+    # Reconstruct conversation for template
+    convo_msgs = [{"role": "system", "content": sys_text}]
+    for m in (history or []):
+        if m and isinstance(m, dict) and m.get("role") in ("user", "assistant", "system"):
+            convo_msgs.append({"role": m["role"], "content": m.get("content", "")})
+    convo_msgs.append({"role": "user", "content": message})
+
+    used_chat_template = False
     if hasattr(global_tokenizer, "apply_chat_template"):
         try:
-            prompt = global_tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-        except ValueError:
-            prompt = _build_fallback_chat_prompt(messages)
+            prompt = global_tokenizer.apply_chat_template(convo_msgs, tokenize=False, add_generation_prompt=True)
+            used_chat_template = True
+        except Exception:
+            # fallback to a clean instruct format
+            prompt = _build_fallback_chat_prompt(convo_msgs)
     else:
-        prompt = _build_fallback_chat_prompt(messages)
+        prompt = _build_fallback_chat_prompt(convo_msgs)
 
+    # --- streaming infra ---
     stop_event = threading.Event()
+
     class StopOnEvent(StoppingCriteria):
         def __init__(self, stop_event):
             super().__init__()
             self.stop_event = stop_event
-
         def __call__(self, input_ids, scores, **kwargs):
             return self.stop_event.is_set()
+
     stopping_criteria = StoppingCriteriaList([StopOnEvent(stop_event)])
-    streamer = TextIteratorStreamer(
-        global_tokenizer,
-        skip_prompt=True,
-        skip_special_tokens=True
-    )
-    inputs = global_tokenizer(prompt, return_tensors="pt").to(global_model.device)
-    # Enforce a minimum generation length to avoid early stop at first token
-    min_tokens = 16 # max(20, min(128, int(max_new_tokens // 8))) #dynamic
+    streamer = TextIteratorStreamer(global_tokenizer, skip_prompt=True, skip_special_tokens=True)
 
-    STABLE_GREEDY = True  # set True for clinical answers
-    DETERMINISTIC = True  # Choose a stable default mode for clinical answers
+    # fit prompt within context window
+    ctx = int(getattr(global_model.config, "max_position_embeddings", 4096))
+    max_inp = max(256, ctx - int(max_new_tokens) - 8)
+    enc = global_tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_inp).to(global_model.device)
 
+    # discourage self-referential prefaces
+    BAD_PHRASES = ["As an AI", "language model", "I cannot provide medical advice"]
+    bad_words_ids = []
+    for phrase in BAD_PHRASES:
+        try:
+            ids = global_tokenizer(phrase, add_special_tokens=False)["input_ids"]
+            if ids:
+                bad_words_ids.append(ids)
+        except Exception:
+            pass
+    if not bad_words_ids:
+        bad_words_ids = None
+
+    # deterministic clinical generation
+    min_tokens = 16
     generation_kwargs = dict(
-        inputs,
+        **enc,
         streamer=streamer,
         max_new_tokens=max_new_tokens,
         min_new_tokens=min_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        top_k=top_k,
-        repetition_penalty=penalty,
-        no_repeat_ngram_size=3,
-        typical_p=0.95,
-        do_sample=True,
+        do_sample=False,             # deterministic
+        temperature=0.0,             # ignored when do_sample=False
+        repetition_penalty=max(1.1, penalty),
+        no_repeat_ngram_size=4,
         use_cache=True,
-        stopping_criteria=stopping_criteria
+        stopping_criteria=stopping_criteria,
+        bad_words_ids=bad_words_ids
     )
 
-    if STABLE_GREEDY:
-        generation_kwargs.update(
-            dict(
-                do_sample=False,           # deterministic
-                temperature=0.0,           # ignored when do_sample=False
-                repetition_penalty=1.2,
-            )
-        )
-    else:
-        generation_kwargs.update(
-            dict(
-                do_sample=True,
-                temperature=float(temperature),
-                top_p=float(top_p),
-                top_k=int(top_k),
-                repetition_penalty=float(penalty),  # make sure UI default >= 1.1
-            )
-        )
-
-    if DETERMINISTIC:
-        generation_kwargs.update(
-            do_sample=False,
-            temperature=0.0,          # ignored when do_sample=False
-            repetition_penalty=1.2,   # >= 1.1
-        )
-    else:
-        generation_kwargs.update(
-            do_sample=True,
-            temperature=float(temperature),   # e.g. 0.2–0.5 safer
-            top_p=float(top_p),               # e.g. 0.8–0.95
-            top_k=int(top_k),                 # e.g. 20–50
-            repetition_penalty=max(1.1, float(penalty)),
-        )
-
-    # Debugs
-    logger.info(f"do_sample={generation_kwargs.get('do_sample')} "
-            f"temp={generation_kwargs.get('temperature')} "
-            f"top_p={generation_kwargs.get('top_p')} "
-            f"top_k={generation_kwargs.get('top_k')} "
-            f"rep_pen={generation_kwargs.get('repetition_penalty')} "
-            f"no_repeat={generation_kwargs.get('no_repeat_ngram_size')}")
-
-    logger.info(f"context_chars={len(context)}")
-    _preview = prompt[:200].replace("\n", " ")
-    logger.info(f"first_200_prompt_chars={_preview}")
-
-
+    logger.info(f"chat_template={'yes' if used_chat_template else 'no'}  ctx={ctx}  max_inp={max_inp}  max_new={max_new_tokens}")
+    logger.info(f"prompt_preview={(prompt[:200].replace(chr(10),' '))}")
     thread = threading.Thread(target=global_model.generate, kwargs=generation_kwargs)
     thread.start()
-    updated_history = history + [
-        {"role": "user", "content": message},
-        {"role": "assistant", "content": ""}
-    ]
+
+    # prime UI
+    updated_history = (history or []) + [{"role": "user", "content": message}, {"role": "assistant", "content": ""}]
     yield updated_history
+
     partial_response = ""
     first_token_received = threading.Event()
+
+    def _watch_first_token():
+        if not first_token_received.wait(timeout=45):
+            logger.warning("Generation timeout: no tokens in 45s; stopping stream.")
+            stop_event.set()
+
+    watchdog = threading.Thread(target=_watch_first_token, daemon=True)
+    watchdog.start()
+
+    try:
+        for chunk in streamer:
+            if chunk and not first_token_received.is_set():
+                first_token_received.set()
+            partial_response += chunk
+            updated_history[-1]["content"] = partial_response
+            yield updated_history
+        # done
+        yield updated_history
+    except GeneratorExit:
+        stop_event.set()
+        thread.join()
+        raise
+    except Exception as e:
+        logger.exception(f"streaming error: {e}")
+        stop_event.set()
+        updated_history[-1]["content"] = (partial_response or "") + "\n\n[Generation stopped due to an internal error.]"
+        yield updated_history
+        
 
     def _watch_first_token():
         # If no tokens after timeout, trigger stop to avoid hangs
@@ -593,6 +648,7 @@ def stream_chat(
         stop_event.set()
         thread.join()
         raise
+
 
 def create_demo():
     with gr.Blocks(css=CSS, theme=gr.themes.Soft()) as demo:
@@ -748,8 +804,8 @@ def create_demo():
                     ],
                     outputs=chatbot
                 )
-
     return demo
+
 
 if __name__ == "__main__":
     initialize_model_and_tokenizer()
