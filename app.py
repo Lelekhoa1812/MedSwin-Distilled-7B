@@ -152,21 +152,51 @@ def initialize_model_and_tokenizer():
         except ValueError as e:
             logger.warning(f"Fast tokenizer load failed ({e}). Retrying with slow tokenizer...")
             global_tokenizer = AutoTokenizer.from_pretrained(MODEL, token=HF_TOKEN, use_fast=False)
-        # Pick a safe dtype based on backend to avoid stalls on CPU/MPS
-        if torch.cuda.is_available():
+        
+        # Ensure PAD exists
+        if global_tokenizer.pad_token_id is None:
+            if global_tokenizer.eos_token is not None:
+                global_tokenizer.pad_token = global_tokenizer.eos_token
+                global_tokenizer.pad_token_id = global_tokenizer.eos_token_id
+            else:
+                global_tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+            
+        # Pick a safe dtype
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
             dtype = torch.bfloat16
+        elif torch.cuda.is_available():
+            dtype = torch.float16
         elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
             dtype = torch.float16
         else:
             dtype = torch.float32
+        logger.info(f"Using dtype: {dtype}")
+        
         global_model = AutoModelForCausalLM.from_pretrained(
             MODEL,
             device_map="auto",
             trust_remote_code=True,
             token=HF_TOKEN,
-            torch_dtype=dtype
+            dtype=dtype,                  # <-- use dtype (not torch_dtype)
+            low_cpu_mem_usage=True,
         )
+
+        # Make model aware of PAD/EOS once; don’t pass them in generate()
+        pad_id = global_tokenizer.pad_token_id
+        eos_id = global_tokenizer.eos_token_id
+        if pad_id is not None:
+            global_model.config.pad_token_id = pad_id
+            global_model.generation_config.pad_token_id = pad_id
+        if eos_id is not None:
+            global_model.config.eos_token_id = eos_id
+            global_model.generation_config.eos_token_id = eos_id
+
+        # If we added a PAD token, adjust embeddings
+        if hasattr(global_model, "resize_token_embeddings"):
+            global_model.resize_token_embeddings(len(global_tokenizer))
+
         logger.info("Model and tokenizer initialized successfully")
+
 
 def get_llm(temperature=0.7, max_new_tokens=256, top_p=0.95, top_k=50):
     global global_model, global_tokenizer
@@ -389,14 +419,13 @@ def stream_chat(
     for entry in history:
         messages.append(entry)
     messages.append({"role": "user", "content": message})
-    if getattr(global_tokenizer, "chat_template", None):
+    if hasattr(global_tokenizer, "apply_chat_template"):
         prompt = global_tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
+            messages, tokenize=False, add_generation_prompt=True
         )
     else:
         prompt = _build_fallback_chat_prompt(messages)
+
     stop_event = threading.Event()
     class StopOnEvent(StoppingCriteria):
         def __init__(self, stop_event):
@@ -413,7 +442,7 @@ def stream_chat(
     )
     inputs = global_tokenizer(prompt, return_tensors="pt").to(global_model.device)
     # Enforce a minimum generation length to avoid early stop at first token
-    min_tokens = max(20, min(312, int(max_new_tokens // 8)))
+    min_tokens = max(20, min(128, int(max_new_tokens // 8)))
     generation_kwargs = dict(
         inputs,
         streamer=streamer,
