@@ -39,7 +39,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 hf_logging.set_verbosity_error()
 
-MODEL = "MedAI-COS30018/MedSwin-7B-Distilled"
+MEDSWIN_MODEL = "MedAI-COS30018/MedSwin-7B-Distilled"
+MEDALPACA_MODEL = "medalpaca/medalpaca-7b"
+MODEL = MEDSWIN_MODEL
 EMBEDDING_MODEL = "abhinand/MedEmbed-large-v0.1"
 HF_TOKEN = os.environ.get("HF_TOKEN")
 if not HF_TOKEN:
@@ -130,6 +132,7 @@ CSS = """
 global_model = None
 global_tokenizer = None
 global_file_info = {}
+model_cache = {}
 
 
 import html
@@ -257,70 +260,75 @@ def build_prompt(messages, tokenizer, system_prompt: str, context: str, source_i
     return instruct, False
 
 
-def initialize_model_and_tokenizer():
-    global global_model, global_tokenizer
-    if global_model is None or global_tokenizer is None:
-        logger.info("Initializing model and tokenizer...")
-        try:
-            global_tokenizer = AutoTokenizer.from_pretrained(MODEL, token=HF_TOKEN)
-        except ValueError as e:
-            logger.warning(f"Fast tokenizer load failed ({e}). Retrying with slow tokenizer...")
-            global_tokenizer = AutoTokenizer.from_pretrained(MODEL, token=HF_TOKEN, use_fast=False)
+def _select_dtype():
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    if torch.cuda.is_available():
+        return torch.float16
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return torch.float32
+    return torch.float32
 
-        # Ensure EOS/PAD exist
-        if global_tokenizer.eos_token_id is None and getattr(global_tokenizer, "eos_token", None) is None:
-            global_tokenizer.eos_token = "</s>"
-        if global_tokenizer.pad_token_id is None and getattr(global_tokenizer, "pad_token", None) is None:
-            if global_tokenizer.eos_token is not None:
-                global_tokenizer.pad_token = global_tokenizer.eos_token
-            else:
-                global_tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
-        global_tokenizer.padding_side = "right"
-            
-        # Pick a safe dtype
-        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-            dtype = torch.bfloat16
-        elif torch.cuda.is_available():
-            dtype = torch.float16
-        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-            dtype = torch.float32
+def _load_model_and_tokenizer(model_name: str):
+    dtype = _select_dtype()
+    logger.info(f"Loading model={model_name} dtype={dtype}")
+    try:
+        tok = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN)
+    except ValueError as e:
+        logger.warning(f"Fast tokenizer load failed ({e}). Retrying with slow tokenizer...")
+        tok = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN, use_fast=False)
+
+    if tok.eos_token_id is None and getattr(tok, "eos_token", None) is None:
+        tok.eos_token = "</s>"
+    if tok.pad_token_id is None and getattr(tok, "pad_token", None) is None:
+        if tok.eos_token is not None:
+            tok.pad_token = tok.eos_token
         else:
-            dtype = torch.float32
-        logger.info(f"Using dtype: {dtype}")
-        
-        global_model = AutoModelForCausalLM.from_pretrained(
-            MODEL,
-            device_map="auto",
-            trust_remote_code=True,
-            token=HF_TOKEN,
-            dtype=dtype,
-            low_cpu_mem_usage=True,
-        )
+            tok.add_special_tokens({"pad_token": "<|pad|>"})
+    tok.padding_side = "right"
 
-        # Make model aware of PAD/EOS once; don’t pass them in generate()
-        pad_id = global_tokenizer.pad_token_id
-        eos_id = global_tokenizer.eos_token_id
-        if pad_id is not None:
-            global_model.config.pad_token_id = pad_id
-            global_model.generation_config.pad_token_id = pad_id
-        if eos_id is not None:
-            global_model.config.eos_token_id = eos_id
-            global_model.generation_config.eos_token_id = eos_id
+    mdl = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        device_map="auto",
+        trust_remote_code=True,
+        token=HF_TOKEN,
+        torch_dtype=dtype,
+        low_cpu_mem_usage=True,
+    )
 
-        # If we added a PAD token, adjust embeddings
-        if hasattr(global_model, "resize_token_embeddings"):
-            try:
-                global_model.resize_token_embeddings(len(global_tokenizer))
-            except Exception:
-                pass
+    if tok.pad_token_id is not None:
+        mdl.config.pad_token_id = tok.pad_token_id
+        mdl.generation_config.pad_token_id = tok.pad_token_id
+    if tok.eos_token_id is not None:
+        mdl.config.eos_token_id = tok.eos_token_id
+        mdl.generation_config.eos_token_id = tok.eos_token_id
 
-        logger.info("Model and tokenizer initialized successfully")
+    if hasattr(mdl, "resize_token_embeddings"):
+        try:
+            mdl.resize_token_embeddings(len(tok))
+        except Exception:
+            pass
+    return tok, mdl
+
+def initialize_model_and_tokenizer(model_name: str = None):
+    global global_model, global_tokenizer, MODEL
+    name = model_name or MODEL
+    if name in model_cache:
+        global_tokenizer, global_model = model_cache[name]
+        MODEL = name
+        return
+    tok, mdl = _load_model_and_tokenizer(name)
+    model_cache[name] = (tok, mdl)
+    global_tokenizer, global_model = tok, mdl
+    MODEL = name
 
 
-def get_llm(temperature=0.0, max_new_tokens=256, top_p=0.95, top_k=50):
+def get_llm(temperature=0.0, max_new_tokens=256, top_p=0.95, top_k=50, model_name: str = None):
     global global_model, global_tokenizer
     if global_model is None or global_tokenizer is None:
-        initialize_model_and_tokenizer()
+        initialize_model_and_tokenizer(model_name)
+    elif model_name:
+        initialize_model_and_tokenizer(model_name)
     
     return HuggingFaceLLM(
         context_window=4096,
@@ -364,7 +372,7 @@ def create_or_update_index(files, request: gr.Request):
     user_id = request.session_hash
     save_dir = f"./{user_id}_index"
     # Initialize LlamaIndex modules
-    llm = get_llm()
+    llm = get_llm(model_name=MODEL)
     embed_model = HuggingFaceEmbedding(model_name=EMBEDDING_MODEL, token=HF_TOKEN)
     Settings.llm = llm
     Settings.embed_model = embed_model
@@ -499,9 +507,9 @@ def stream_chat(
     retriever_k    = int(retriever_k)    if isinstance(retriever_k,  (int, float)) else 15
     merge_threshold= float(merge_threshold) if isinstance(merge_threshold, (int, float)) else 0.5
 
-    # ensure model/tokenizer exist
+    # ensure model/tokenizer exist (uses currently selected MODEL)
     if global_model is None or global_tokenizer is None:
-        initialize_model_and_tokenizer()
+        initialize_model_and_tokenizer(MODEL)
 
     # --- retrieval (optional) ---
     context = ""
@@ -707,6 +715,11 @@ def create_demo():
                     show_label=False,
                     type="messages"
                 )
+                model_selector = gr.Radio(
+                    choices=["MedSwin-7B Distilled", "MedAlpaca-7B"],
+                    value="MedSwin-7B Distilled",
+                    label="Model"
+                )
                 disable_retrieval = gr.Checkbox(
                     label="Disable document retrieval (use model ground knowledge)",
                     value=False
@@ -791,6 +804,33 @@ def create_demo():
                             label="Merge Threshold (lower = more merging)"
                         )
 
+                def _on_model_change(choice):
+                    name = MEDSWIN_MODEL if choice == "MedSwin-7B Distilled" else MEDALPACA_MODEL
+                    initialize_model_and_tokenizer(name)
+                    return f"Loaded: {choice}"
+
+                submit_button.click(
+                    fn=stream_chat,
+                    inputs=[
+                        message_input, 
+                        chatbot, 
+                        system_prompt, 
+                        disable_retrieval,
+                        temperature, 
+                        max_new_tokens, 
+                        top_p, 
+                        top_k, 
+                        penalty,
+                        retriever_k,
+                        merge_threshold
+                    ],
+                    outputs=chatbot
+                )
+                model_selector.change(
+                    fn=_on_model_change,
+                    inputs=[model_selector],
+                    outputs=[]
+                )
                 submit_button.click(
                     fn=stream_chat,
                     inputs=[
@@ -809,6 +849,28 @@ def create_demo():
                     outputs=chatbot
                 )
                 
+                message_input.submit(
+                    fn=stream_chat,
+                    inputs=[
+                        message_input, 
+                        chatbot, 
+                        system_prompt, 
+                        disable_retrieval,
+                        temperature, 
+                        max_new_tokens, 
+                        top_p, 
+                        top_k, 
+                        penalty,
+                        retriever_k,
+                        merge_threshold
+                    ],
+                    outputs=chatbot
+                )
+                model_selector.change(
+                    fn=_on_model_change,
+                    inputs=[model_selector],
+                    outputs=[]
+                )
                 message_input.submit(
                     fn=stream_chat,
                     inputs=[
