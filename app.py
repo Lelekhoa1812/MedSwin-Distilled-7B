@@ -413,8 +413,18 @@ def stream_chat(
     )
     inputs = global_tokenizer(prompt, return_tensors="pt").to(global_model.device)
     # Ensure proper termination tokens are set for generation
-    eos_id = global_tokenizer.eos_token_id
-    pad_id = global_tokenizer.pad_token_id or eos_id
+    eos_candidates = set()
+    if isinstance(getattr(global_tokenizer, "eos_token_id", None), int):
+        eos_candidates.add(global_tokenizer.eos_token_id)
+    for tok in ("<|eot_id|>", "<|end_of_text|>", "<eos>"):
+        try:
+            tid = global_tokenizer.convert_tokens_to_ids(tok)
+            if isinstance(tid, int) and tid != global_tokenizer.unk_token_id and tid != -1:
+                eos_candidates.add(tid)
+        except Exception:
+            pass
+    eos_id = list(eos_candidates) if eos_candidates else None
+    pad_id = global_tokenizer.pad_token_id or (global_tokenizer.eos_token_id if isinstance(global_tokenizer.eos_token_id, int) else None)
     generation_kwargs = dict(
         inputs,
         streamer=streamer,
@@ -455,6 +465,7 @@ def stream_chat(
             updated_history[-1]["content"] = partial_response
             yield updated_history
         output_ids = global_tokenizer.encode(partial_response, return_tensors="pt")
+        logger.info(f"Stream finished. Generated tokens: {output_ids.shape[-1] if hasattr(output_ids, 'shape') else 'n/a'}")
         yield updated_history
     except GeneratorExit:
         stop_event.set()
