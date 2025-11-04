@@ -543,46 +543,47 @@ def stream_chat(
     try:
         if not disable_retrieval:
             if not os.path.exists(index_dir):
-                yield history + [{"role": "assistant", "content": "Please upload documents first or enable 'Disable document retrieval' to chat without documents."}]
+                yield history + [{"role": "assistant", "content":
+                    "Please upload documents first or enable 'Disable document retrieval' to chat without documents."}]
                 return
 
-        embed_model = HuggingFaceEmbedding(model_name=EMBEDDING_MODEL, token=HF_TOKEN)
-        Settings.embed_model = embed_model
+            embed_model = HuggingFaceEmbedding(model_name=EMBEDDING_MODEL, token=HF_TOKEN)
+            Settings.embed_model = embed_model
 
-        storage_context = StorageContext.from_defaults(persist_dir=index_dir)
-        index = load_index_from_storage(storage_context, settings=Settings)
+            storage_context = StorageContext.from_defaults(persist_dir=index_dir)
+            index = load_index_from_storage(storage_context, settings=Settings)
 
-        base_retriever = index.as_retriever(similarity_top_k=retriever_k)
-        auto_merging_retriever = AutoMergingRetriever(
-            base_retriever,
-            storage_context=storage_context,
-            simple_ratio_thresh=merge_threshold, 
-            verbose=True
-        )
+            base_retriever = index.as_retriever(similarity_top_k=retriever_k)
+            auto_merging_retriever = AutoMergingRetriever(
+                base_retriever,
+                storage_context=storage_context,
+                simple_ratio_thresh=merge_threshold, 
+                verbose=True
+            )
 
-        logger.info(f"[query] {message}")
-        t0 = time.time()
-        base_nodes = base_retriever.retrieve(message)
-        logger.info(f"[retrieval] base={len(base_nodes)} in {time.time()-t0:.2f}s")
+            logger.info(f"[query] {message}")
+            t0 = time.time()
+            base_nodes = base_retriever.retrieve(message)
+            logger.info(f"[retrieval] base={len(base_nodes)} in {time.time()-t0:.2f}s")
 
-        t1 = time.time()
-        merged_nodes = auto_merging_retriever.retrieve(message)
-        logger.info(f"[retrieval] merged={len(merged_nodes)} in {time.time()-t1:.2f}s")
+            t1 = time.time()
+            merged_nodes = auto_merging_retriever.retrieve(message)
+            logger.info(f"[retrieval] merged={len(merged_nodes)} in {time.time()-t1:.2f}s")
 
-        # merge text + normalize + truncate by tokens to keep headroom for generation
-        context = "\n\n".join([(n.node.text or "") for n in merged_nodes])
-        context = _normalize_text(context)
-        context = _truncate_by_tokens(context, global_tokenizer, max_tokens=1800)
+            # merge text + normalize + truncate by tokens to keep headroom for generation
+            context = "\n\n".join([(n.node.text or "") for n in merged_nodes])
+            context = _normalize_text(context)
+            context = _truncate_by_tokens(context, global_tokenizer, max_tokens=1800)
 
-        # compact source list
-        srcs = []
-        for n in merged_nodes:
-            md = getattr(n.node, "metadata", {}) or {}
-            fn = md.get("file_name")
-            if fn and fn not in srcs:
-                srcs.append(fn)
-        if srcs:
-            source_info = "\n\n[Sources] " + ", ".join(srcs)
+            # compact source list
+            srcs = []
+            for n in merged_nodes:
+                md = getattr(n.node, "metadata", {}) or {}
+                fn = md.get("file_name")
+                if fn and fn not in srcs:
+                    srcs.append(fn)
+            if srcs:
+                source_info = "\n\n[Sources] " + ", ".join(srcs)
     except Exception as e:
         logger.exception(f"retrieval error: {e}")
         # fallback to no context rather than failing the chat
@@ -638,6 +639,11 @@ def stream_chat(
 
     # deterministic clinical generation
     min_tokens = 16
+
+    pad_id = global_tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = global_tokenizer.eos_token_id
+    eos_id = global_tokenizer.eos_token_id
     
     generation_kwargs = dict(
         **enc,
@@ -650,8 +656,8 @@ def stream_chat(
         use_cache=True,
         stopping_criteria=stopping_criteria,
         bad_words_ids=bad_words_ids,
-        eos_token_id=global_tokenizer.eos_token_id,
-        pad_token_id=global_tokenizer.pad_token_id or global_tokenizer.eos_token_id,
+        eos_token_id=eos_id,
+        pad_token_id=pad_id,
     )
     if use_sampling:
         generation_kwargs.update(
@@ -688,8 +694,9 @@ def stream_chat(
             updated_history[-1]["content"] = partial_response
             yield updated_history
 
-        # Minimal postprocessing: trim whitespace only
+        # Minimal postprocessing: trim + clean filler/disclaimers
         final_text = (partial_response or "").strip()
+        final_text = _clean_leading_filler(_strip_disclaimers(final_text))
         updated_history[-1]["content"] = final_text
         yield updated_history
 
@@ -839,82 +846,24 @@ def create_demo():
 
                 submit_button.click(
                     fn=stream_chat,
-                    inputs=[
-                        message_input, 
-                        chatbot, 
-                        system_prompt, 
-                        disable_retrieval,
-                        temperature, 
-                        max_new_tokens, 
-                        top_p, 
-                        top_k, 
-                        penalty,
-                        retriever_k,
-                        merge_threshold
-                    ],
+                    inputs=[message_input, chatbot, system_prompt, disable_retrieval,
+                            temperature, max_new_tokens, top_p, top_k, penalty,
+                            retriever_k, merge_threshold],
                     outputs=chatbot
                 )
+
+                message_input.submit(
+                    fn=stream_chat,
+                    inputs=[message_input, chatbot, system_prompt, disable_retrieval,
+                            temperature, max_new_tokens, top_p, top_k, penalty,
+                            retriever_k, merge_threshold],
+                    outputs=chatbot
+                )
+
                 model_selector.change(
                     fn=_on_model_change,
                     inputs=[model_selector],
                     outputs=[]
-                )
-                submit_button.click(
-                    fn=stream_chat,
-                    inputs=[
-                        message_input, 
-                        chatbot, 
-                        system_prompt, 
-                        disable_retrieval,
-                        temperature, 
-                        max_new_tokens, 
-                        top_p, 
-                        top_k, 
-                        penalty,
-                        retriever_k,
-                        merge_threshold
-                    ],
-                    outputs=chatbot
-                )
-                
-                message_input.submit(
-                    fn=stream_chat,
-                    inputs=[
-                        message_input, 
-                        chatbot, 
-                        system_prompt, 
-                        disable_retrieval,
-                        temperature, 
-                        max_new_tokens, 
-                        top_p, 
-                        top_k, 
-                        penalty,
-                        retriever_k,
-                        merge_threshold
-                    ],
-                    outputs=chatbot
-                )
-                model_selector.change(
-                    fn=_on_model_change,
-                    inputs=[model_selector],
-                    outputs=[]
-                )
-                message_input.submit(
-                    fn=stream_chat,
-                    inputs=[
-                        message_input, 
-                        chatbot, 
-                        system_prompt, 
-                        disable_retrieval,
-                        temperature, 
-                        max_new_tokens, 
-                        top_p, 
-                        top_k, 
-                        penalty,
-                        retriever_k,
-                        merge_threshold
-                    ],
-                    outputs=chatbot
                 )
     return demo
 
