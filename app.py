@@ -246,12 +246,14 @@ def build_prompt(messages, tokenizer, system_prompt: str, context: str, source_i
     if context:
         sys = f"{sys}\n\n[Document Context]\n{context}{source_info}"
 
-    # Prefer chat template when available (chat-tuned models)
-    if hasattr(tokenizer, "apply_chat_template"):
+    # Prefer chat template only for models known to support it reliably.
+    # For MedSwin / MedAlpaca SFTs, stick to a clean instruct fallback to avoid off-topic outputs.
+    model_name_lower = (getattr(tokenizer, 'name_or_path', '') or '').lower()
+    allow_template = not ("medswin" in model_name_lower or "medalpaca" in model_name_lower)
+    if allow_template and hasattr(tokenizer, "apply_chat_template"):
         try:
             chat_msgs = [{"role": "system", "content": sys}]
             for m in messages:
-                # Gradio `type="messages"` gives {"role": "...", "content": "..."}
                 if m.get("role") in ("user", "assistant", "system"):
                     chat_msgs.append({"role": m["role"], "content": m.get("content","")})
             return tokenizer.apply_chat_template(
@@ -334,6 +336,12 @@ def _load_model_and_tokenizer(model_name: str):
             mdl.resize_token_embeddings(len(tok))
         except Exception:
             pass
+    logger.info(
+        "tokenizer(name=%s, has_template=%s, eos=%s, pad=%s, bos=%s)",
+        getattr(tok, 'name_or_path', ''),
+        hasattr(tok, 'chat_template') and bool(getattr(tok, 'chat_template', None)),
+        str(tok.eos_token), str(tok.pad_token), str(tok.bos_token),
+    )
     return tok, mdl
 
 def initialize_model_and_tokenizer(model_name: str = None):
@@ -628,7 +636,13 @@ def stream_chat(
     # fit prompt within context window
     ctx = int(getattr(global_model.config, "max_position_embeddings", 4096))
     max_inp = max(256, ctx - int(max_new_tokens) - 8)
-    enc = global_tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_inp).to(global_model.device)
+    enc = global_tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_inp,
+        add_special_tokens=False,
+    ).to(global_model.device)
 
     # avoid aggressive bad-words filtering which can distort outputs
     bad_words_ids = None
@@ -772,15 +786,11 @@ def create_demo():
                 with gr.Accordion("Advanced Settings", open=False):
                     system_prompt = gr.Textbox(
                         value=(
-                            "You are a cautious, evidence-focused medical assistant.\n"
-                            "- Write directly to the user in second person (use 'you'); never say 'the user' or 'the patient'.\n"
-                            "- Be concise (≤150 words). Use clinical language and bullet points only if helpful.\n"
-                            "- If context is insufficient, say exactly what is missing. Do not fabricate.\n"
-                            "- If you used provided documents, cite filenames in brackets (e.g., [guideline.pdf]).\n"
-                            "- Do not include disclaimers, meta-commentary, or references to being an AI."
+                            "Answer clinically and concisely using the provided context. "
+                            "If context is insufficient, state what is missing. Cite filenames in brackets when used."
                         ),
                         label="System Prompt",
-                        lines=5
+                        lines=3
                     )
                     gr.Markdown(
                         "**Clinical Use Disclaimer:** This application is intended for informational purposes only and does not constitute medical advice. "
@@ -791,35 +801,35 @@ def create_demo():
                             minimum=0,
                             maximum=1,
                             step=0.1,
-                            value=0.2,  
+                            value=0.1,
                             label="Temperature"
                         )
                         max_new_tokens = gr.Slider(
-                            minimum=128,
-                            maximum=8192,
-                            step=64,
-                            value=1024,
+                            minimum=64,
+                            maximum=1024,
+                            step=32,
+                            value=512,
                             label="Max New Tokens",
                         )
                         top_p = gr.Slider(
                             minimum=0.0,
                             maximum=1.0,
-                            step=0.1,
-                            value=0.9, 
+                            step=0.05,
+                            value=0.5,
                             label="Top P"
                         )
                         top_k = gr.Slider(
                             minimum=1,
-                            maximum=100,  
+                            maximum=100,
                             step=1,
-                            value=50,  
+                            value=20,
                             label="Top K"
                         )
                         penalty = gr.Slider(
                             minimum=0.0,
                             maximum=2.0,
                             step=0.1,
-                            value=1.15,
+                            value=1.3,
                             label="Repetition Penalty"
                         )
                         
