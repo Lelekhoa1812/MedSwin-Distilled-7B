@@ -152,12 +152,19 @@ def initialize_model_and_tokenizer():
         except ValueError as e:
             logger.warning(f"Fast tokenizer load failed ({e}). Retrying with slow tokenizer...")
             global_tokenizer = AutoTokenizer.from_pretrained(MODEL, token=HF_TOKEN, use_fast=False)
+        # Pick a safe dtype based on backend to avoid stalls on CPU/MPS
+        if torch.cuda.is_available():
+            dtype = torch.bfloat16
+        elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            dtype = torch.float16
+        else:
+            dtype = torch.float32
         global_model = AutoModelForCausalLM.from_pretrained(
             MODEL,
             device_map="auto",
             trust_remote_code=True,
             token=HF_TOKEN,
-            torch_dtype=torch.bfloat16
+            torch_dtype=dtype
         )
         logger.info("Model and tokenizer initialized successfully")
 
@@ -405,6 +412,9 @@ def stream_chat(
         skip_special_tokens=True
     )
     inputs = global_tokenizer(prompt, return_tensors="pt").to(global_model.device)
+    # Ensure proper termination tokens are set for generation
+    eos_id = global_tokenizer.eos_token_id
+    pad_id = global_tokenizer.pad_token_id or eos_id
     generation_kwargs = dict(
         inputs,
         streamer=streamer,
@@ -414,6 +424,9 @@ def stream_chat(
         top_k=top_k,
         repetition_penalty=penalty,
         do_sample=True,
+        use_cache=True,
+        eos_token_id=eos_id,
+        pad_token_id=pad_id,
         stopping_criteria=stopping_criteria
     )
     thread = threading.Thread(target=global_model.generate, kwargs=generation_kwargs)
@@ -424,8 +437,20 @@ def stream_chat(
     ]
     yield updated_history
     partial_response = ""
+    first_token_received = threading.Event()
+
+    def _watch_first_token():
+        # If no tokens after timeout, trigger stop to avoid hangs
+        if not first_token_received.wait(timeout=45):
+            logger.warning("Generation timeout: no tokens received in 45s; stopping stream.")
+            stop_event.set()
+
+    watchdog = threading.Thread(target=_watch_first_token, daemon=True)
+    watchdog.start()
     try:
         for new_text in streamer:
+            if new_text and not first_token_received.is_set():
+                first_token_received.set()
             partial_response += new_text
             updated_history[-1]["content"] = partial_response
             yield updated_history
