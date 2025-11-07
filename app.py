@@ -231,6 +231,33 @@ def _clean_leading_filler(text: str) -> str:
     return cleaned
 
 
+def _detect_language(text: str) -> str:
+    """Simple language detection - returns 'vi' for Vietnamese, 'en' for English, or 'other'"""
+    if not text:
+        return 'en'
+    
+    # Vietnamese has distinctive characters: ă, â, đ, ê, ô, ơ, ư
+    vietnamese_chars = set('ăâđêôơưĂÂĐÊÔƠƯ')
+    text_chars = set(text)
+    
+    # Count Vietnamese-specific characters
+    vi_char_count = len(text_chars & vietnamese_chars)
+    # If more than 2% of unique characters are Vietnamese-specific, likely Vietnamese
+    if vi_char_count > 0 and len(text) > 20:
+        # Check for common Vietnamese words/patterns
+        vi_patterns = [
+            r'\b(của|và|với|cho|được|trong|này|đó|khi|nếu|vì|nên|nhưng|hoặc)\b',
+            r'\b(là|sẽ|có|không|đã|đang|sẽ|bị|bởi)\b',
+            r'\b(người|bệnh|thuốc|điều trị|triệu chứng)\b',
+        ]
+        vi_matches = sum(len(re.findall(p, text, re.I)) for p in vi_patterns)
+        if vi_matches > 2 or (vi_char_count > 0 and len(text) < 100):
+            return 'vi'
+    
+    # Default to English
+    return 'en'
+
+
 def _build_fallback_chat_prompt(messages, include_history: bool = True, max_history_pairs: int = 1):
     # Alpaca-style fallback prompt that works well with MedAlpaca/Gemma-derived SFTs
     # We collapse system + last user turn into an Instruction, keep brief history inline
@@ -676,6 +703,10 @@ def stream_chat(
     if global_model is None or global_tokenizer is None:
         initialize_model_and_tokenizer(MODEL)
 
+    # --- language detection ---
+    detected_lang = _detect_language(message)
+    logger.info(f"[language] detected={detected_lang} for query: {message[:50]}...")
+    
     # --- retrieval (optional) ---
     context = ""
     source_info = ""
@@ -709,10 +740,20 @@ def stream_chat(
             merged_nodes = auto_merging_retriever.retrieve(message)
             logger.info(f"[retrieval] merged={len(merged_nodes)} in {time.time()-t1:.2f}s")
 
+            # For Vietnamese queries, be more selective with context to avoid hallucinations
+            # Only use context if it's highly relevant (top 3-5 nodes) and filter out irrelevant content
+            if detected_lang == 'vi':
+                # Use fewer, more relevant nodes for Vietnamese to reduce hallucination
+                merged_nodes = merged_nodes[:min(5, len(merged_nodes))]
+                logger.info(f"[retrieval] Vietnamese query - limiting to top {len(merged_nodes)} nodes")
+            
             # merge text + normalize + truncate by tokens to keep headroom for generation
             context = "\n\n".join([(n.node.text or "") for n in merged_nodes])
             context = _normalize_text(context)
-            context = _truncate_by_tokens(context, global_tokenizer, max_tokens=1800)
+            
+            # For Vietnamese, use less context to avoid confusion
+            max_context_tokens = 1200 if detected_lang == 'vi' else 1800
+            context = _truncate_by_tokens(context, global_tokenizer, max_tokens=max_context_tokens)
 
             # compact source list
             srcs = []
@@ -730,26 +771,53 @@ def stream_chat(
 
     # --- prompt building (template-aware) ---
     sys_text = (system_prompt or "").strip()
-    if context:
-        sys_text = f"{sys_text}\n\n[Document Context]\n{context}{source_info}"
+    
+    # Handle system prompt based on language and whether RAG is enabled
+    if detected_lang == 'vi':
+        if context:
+            # For Vietnamese with context, be more explicit about using only relevant context
+            sys_text = f"{sys_text}\n\n[Lưu ý: Chỉ sử dụng thông tin từ ngữ cảnh tài liệu nếu nó liên quan trực tiếp đến câu hỏi.]\n\n[Document Context]\n{context}{source_info}"
+        else:
+            # For Vietnamese without context (RAG disabled), emphasize using medical knowledge
+            if disable_retrieval:
+                sys_text = f"{sys_text}\n\n[Lưu ý: Trả lời bằng tiếng Việt dựa trên kiến thức y tế của bạn.]"
+            else:
+                sys_text = f"{sys_text}\n\n[Lưu ý: Trả lời bằng tiếng Việt dựa trên kiến thức y tế của bạn.]"
+    else:
+        # For English/other languages
+        if context:
+            # Add context normally when RAG is enabled
+            sys_text = f"{sys_text}\n\n[Document Context]\n{context}{source_info}"
+        elif disable_retrieval:
+            # When RAG is disabled, instruct model to use its own medical knowledge
+            sys_text = f"{sys_text}\n\n[Note: Answer based on your medical knowledge.]"
 
     # Reconstruct conversation for template with smart history filtering
     # Only include recent, relevant history to avoid confusion and hallucinations
+    # For Vietnamese queries, be even more restrictive with history
     convo_msgs = [{"role": "system", "content": sys_text}]
     
     # Filter history: only include complete QA pairs that are recent and relevant
     filtered_history = []
     if history:
-        # Get last few messages (max 4 messages = 2 QA pairs)
-        recent_history = history[-4:] if len(history) > 4 else history
+        # For Vietnamese, only include last 2 messages (1 QA pair) to reduce confusion
+        max_history = 2 if detected_lang == 'vi' else 4
+        recent_history = history[-max_history:] if len(history) > max_history else history
         
         # Only include if messages form complete pairs and are substantial
+        # For Vietnamese, also check that history is in same language
         for i, m in enumerate(recent_history):
             if m and isinstance(m, dict) and m.get("role") in ("user", "assistant"):
                 content = m.get("content", "").strip()
                 # Only include if content is substantial (not empty or very short)
                 if len(content) > 5:
-                    filtered_history.append({"role": m["role"], "content": content})
+                    # For Vietnamese, only include history if it's also Vietnamese
+                    if detected_lang == 'vi':
+                        hist_lang = _detect_language(content)
+                        if hist_lang == 'vi':
+                            filtered_history.append({"role": m["role"], "content": content})
+                    else:
+                        filtered_history.append({"role": m["role"], "content": content})
     
     # Add filtered history
     for m in filtered_history:
@@ -812,13 +880,18 @@ def stream_chat(
 
     # Honour temperature: sample iff temperature > 0
     use_sampling = float(temperature) > 0.0
-    # Set minimum tokens to ensure complete responses (increased from 16 to ensure models don't stop prematurely)
-    min_tokens = max(32, int(max_new_tokens * 0.05))  # At least 5% of max_new_tokens or 32, whichever is higher
+    # Set minimum tokens to ensure complete responses - increased significantly to prevent premature stopping
+    # Use at least 10% of max_new_tokens or 64 tokens, whichever is higher
+    min_tokens = max(64, int(max_new_tokens * 0.10))
 
     pad_id = global_tokenizer.pad_token_id
     if pad_id is None:
         pad_id = global_tokenizer.eos_token_id
     eos_id = global_tokenizer.eos_token_id
+    
+    # Configure stop sequences to prevent premature stopping
+    # Don't stop on common mid-sentence patterns that might appear in medical text
+    stop_sequences = None  # Let the model use its natural EOS token
     
     generation_kwargs = dict(
         **enc,
@@ -834,6 +907,9 @@ def stream_chat(
         eos_token_id=eos_id,
         pad_token_id=pad_id,
     )
+    
+    # Ensure we don't stop prematurely by not setting early_stopping
+    # The model should generate until max_new_tokens or natural EOS
     if use_sampling:
         generation_kwargs.update(
             temperature=float(temperature),
