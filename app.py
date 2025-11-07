@@ -164,7 +164,8 @@ def _truncate_by_tokens(text: str, tokenizer, max_tokens: int = 1800) -> str:
     ids = tokenizer(text, add_special_tokens=False, return_attention_mask=False)["input_ids"]
     if len(ids) <= max_tokens:
         return text
-    return tokenizer.decode(ids[-max_tokens:], skip_special_tokens=True)
+    # Preserve special tokens for proper decoding, especially for non-English languages
+    return tokenizer.decode(ids[-max_tokens:], skip_special_tokens=False)
 
 
 DISCLAIMER_PATTERNS = [
@@ -208,7 +209,7 @@ def _clean_leading_filler(text: str) -> str:
     return cleaned
 
 
-def _build_fallback_chat_prompt(messages):
+def _build_fallback_chat_prompt(messages, include_history: bool = True, max_history_pairs: int = 1):
     # Alpaca-style fallback prompt that works well with MedAlpaca/Gemma-derived SFTs
     # We collapse system + last user turn into an Instruction, keep brief history inline
     sys_blocks = [m.get("content", "").strip() for m in messages if m.get("role") == "system"]
@@ -216,22 +217,31 @@ def _build_fallback_chat_prompt(messages):
     user_turns = [m.get("content", "").strip() for m in messages if m.get("role") == "user"]
     last_user = user_turns[-1] if user_turns else ""
 
-    history_pairs = []
-    current_q = None
-    for m in messages:
-        role = m.get("role")
-        content = (m.get("content", "") or "").strip()
-        if role == "user":
-            current_q = content
-        elif role == "assistant" and current_q:
-            history_pairs.append((current_q, content))
-            current_q = None
-
-    history_text = "\n".join([f"Q: {q}\nA: {a}" for q, a in history_pairs[-2:]])  # keep last 2 QA pairs
-
     instruction = sys_text
-    if history_text:
-        instruction += f"\n\nContext Conversation (for background):\n{history_text}"
+    
+    # Only include history if explicitly requested and if it's relevant
+    if include_history:
+        history_pairs = []
+        current_q = None
+        for m in messages:
+            role = m.get("role")
+            content = (m.get("content", "") or "").strip()
+            if role == "user":
+                current_q = content
+            elif role == "assistant" and current_q:
+                # Only include complete QA pairs with substantial content
+                if len(current_q.strip()) > 10 and len(content.strip()) > 10:
+                    history_pairs.append((current_q, content))
+                current_q = None
+
+        # Only include recent, relevant history (default: last 1 pair, max 2)
+        if history_pairs:
+            recent_pairs = history_pairs[-max_history_pairs:]
+            # Only include if the last question is different from current question
+            if recent_pairs and recent_pairs[-1][0] != last_user:
+                history_text = "\n".join([f"Q: {q}\nA: {a}" for q, a in recent_pairs])
+                instruction += f"\n\nContext Conversation (for background):\n{history_text}"
+    
     if last_user:
         instruction += f"\n\nTask: Answer the user's question.\nQuestion: {last_user}"
 
@@ -604,11 +614,29 @@ def stream_chat(
     if context:
         sys_text = f"{sys_text}\n\n[Document Context]\n{context}{source_info}"
 
-    # Reconstruct conversation for template
+    # Reconstruct conversation for template with smart history filtering
+    # Only include recent, relevant history to avoid confusion and hallucinations
     convo_msgs = [{"role": "system", "content": sys_text}]
-    for m in (history or []):
-        if m and isinstance(m, dict) and m.get("role") in ("user", "assistant", "system"):
-            convo_msgs.append({"role": m["role"], "content": m.get("content", "")})
+    
+    # Filter history: only include complete QA pairs that are recent and relevant
+    filtered_history = []
+    if history:
+        # Get last few messages (max 4 messages = 2 QA pairs)
+        recent_history = history[-4:] if len(history) > 4 else history
+        
+        # Only include if messages form complete pairs and are substantial
+        for i, m in enumerate(recent_history):
+            if m and isinstance(m, dict) and m.get("role") in ("user", "assistant"):
+                content = m.get("content", "").strip()
+                # Only include if content is substantial (not empty or very short)
+                if len(content) > 5:
+                    filtered_history.append({"role": m["role"], "content": content})
+    
+    # Add filtered history
+    for m in filtered_history:
+        convo_msgs.append(m)
+    
+    # Add current message
     convo_msgs.append({"role": "user", "content": message})
 
     used_chat_template = False
@@ -617,10 +645,11 @@ def stream_chat(
             prompt = global_tokenizer.apply_chat_template(convo_msgs, tokenize=False, add_generation_prompt=True)
             used_chat_template = True
         except Exception:
-            # fallback to a clean instruct format
-            prompt = _build_fallback_chat_prompt(convo_msgs)
+            # fallback to a clean instruct format with limited history
+            prompt = _build_fallback_chat_prompt(convo_msgs, include_history=len(filtered_history) > 0, max_history_pairs=1)
     else:
-        prompt = _build_fallback_chat_prompt(convo_msgs)
+        # Use fallback with limited history
+        prompt = _build_fallback_chat_prompt(convo_msgs, include_history=len(filtered_history) > 0, max_history_pairs=1)
 
     # --- streaming infra ---
     stop_event = threading.Event()
@@ -633,28 +662,39 @@ def stream_chat(
             return self.stop_event.is_set()
 
     stopping_criteria = StoppingCriteriaList([StopOnEvent(stop_event)])
-    streamer = TextIteratorStreamer(global_tokenizer, skip_prompt=True, skip_special_tokens=True)
+    # Don't skip special tokens - they're important for proper decoding, especially for non-English languages
+    # skip_special_tokens=False ensures Vietnamese and other languages decode correctly
+    streamer = TextIteratorStreamer(global_tokenizer, skip_prompt=True, skip_special_tokens=False)
 
     # fit prompt within context window
     ctx = int(getattr(global_model.config, "max_position_embeddings", 4096))
     max_inp = max(256, ctx - int(max_new_tokens) - 8)
+    
+    # Tokenize with proper handling to avoid cutting in the middle of tokens
+    # This is especially important for Vietnamese and other languages with complex tokenization
     enc = global_tokenizer(
         prompt,
         return_tensors="pt",
         truncation=True,
         max_length=max_inp,
         add_special_tokens=False,
-    ).to(global_model.device)
+        padding=False,
+    )
+    
+    # Ensure input_ids are on the correct device
+    if hasattr(enc, 'to'):
+        enc = enc.to(global_model.device)
+    else:
+        # Handle case where enc is a dict
+        enc = {k: v.to(global_model.device) if hasattr(v, 'to') else v for k, v in enc.items()}
 
     # avoid aggressive bad-words filtering which can distort outputs
     bad_words_ids = None
 
     # Honour temperature: sample iff temperature > 0
     use_sampling = float(temperature) > 0.0
-    min_tokens = 16
-
-    # deterministic clinical generation
-    min_tokens = 16
+    # Set minimum tokens to ensure complete responses (increased from 16 to ensure models don't stop prematurely)
+    min_tokens = max(32, int(max_new_tokens * 0.05))  # At least 5% of max_new_tokens or 32, whichever is higher
 
     pad_id = global_tokenizer.pad_token_id
     if pad_id is None:
@@ -711,16 +751,36 @@ def stream_chat(
     watchdog.start()
 
     try:
+        # Wait for generation to complete properly
         for chunk in streamer:
             if chunk and not first_token_received.is_set():
                 first_token_received.set()
-            partial_response += chunk
-            updated_history[-1]["content"] = partial_response
-            yield updated_history
-
+            if chunk:
+                partial_response += chunk
+                updated_history[-1]["content"] = partial_response
+                yield updated_history
+        
+        # Wait for the generation thread to complete to ensure all tokens are processed
+        # join() returns None if thread completed, or raises/returns thread if still running
+        thread.join(timeout=5.0)
+        
+        # Check if thread is still alive (didn't complete)
+        if thread.is_alive():
+            logger.warning("Generation thread may not have completed fully within timeout")
+        
         # Minimal postprocessing: trim + clean filler/disclaimers
+        # Only clean if we have substantial content
         final_text = (partial_response or "").strip()
-        final_text = _clean_leading_filler(_strip_disclaimers(final_text))
+        if len(final_text) > 10:  # Only clean if we have meaningful content
+            # Remove any special token strings that might have appeared (e.g., <|endoftext|>, </s>, etc.)
+            # This is safe because we preserved special tokens during decoding for proper language handling
+            special_token_strings = [
+                "<|endoftext|>", "</s>", "<s>", "<|pad|>", 
+                "<|im_start|>", "<|im_end|>", "<|user|>", "<|assistant|>"
+            ]
+            for token_str in special_token_strings:
+                final_text = final_text.replace(token_str, "")
+            final_text = _clean_leading_filler(_strip_disclaimers(final_text))
         updated_history[-1]["content"] = final_text
         yield updated_history
 
