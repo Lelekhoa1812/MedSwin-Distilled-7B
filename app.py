@@ -1117,11 +1117,18 @@ def stream_chat(
         
         # Function to check if response is complete
         def is_response_complete(text):
-            """Check if the response seems complete or incomplete."""
+            """Check if the response seems complete or incomplete.
+            
+            This should be less strict - if response is substantial and on-topic,
+            we should allow continuation even if it seems incomplete.
+            """
             if not text or len(text.strip()) < 10:
                 return False
             
             text = text.strip()
+            
+            # If response is very long (>3000 chars), be more lenient about completeness
+            is_substantial = len(text) > 3000
             
             # Check for incomplete indicators
             incomplete_indicators = [
@@ -1135,7 +1142,8 @@ def stream_chat(
                 text.endswith(' to'),
                 text.endswith(' the'),
                 # Check if last sentence is incomplete (no period, exclamation, or question mark)
-                len(text) > 50 and not any(text.rstrip().endswith(p) for p in ['.', '!', '?', ':', '\n'])
+                # But be more lenient if response is substantial
+                len(text) > 50 and not any(text.rstrip().endswith(p) for p in ['.', '!', '?', ':', '\n']) and not is_substantial
             ]
             
             # Also check if response seems to be cut off mid-word or mid-sentence
@@ -1145,9 +1153,10 @@ def stream_chat(
                 if len(text_rstrip) > 0:
                     last_char = text_rstrip[-1]
                     # If ends with lowercase and no punctuation, might be incomplete
+                    # But be more lenient if response is substantial
                     if last_char not in ['.', '!', '?', ':', '\n', ')', ']', '}']:
                         # Check if it looks like mid-sentence
-                        if not last_char.isupper() and not any(incomplete_indicators):
+                        if not last_char.isupper() and not any(incomplete_indicators) and not is_substantial:
                             # Might be incomplete if it doesn't end with proper punctuation
                             return False
             
@@ -1161,8 +1170,9 @@ def stream_chat(
             ]
             
             # If text ends with a structure indicator or continuation word, might be incomplete
+            # But be more lenient if response is substantial
             last_50_chars = text[-50:].lower()
-            if any(indicator in last_50_chars for indicator in structure_indicators):
+            if any(indicator in last_50_chars for indicator in structure_indicators) and not is_substantial:
                 # Check if it's actually ending with these words (incomplete)
                 last_words = text.split()[-3:]
                 if any(word.lower() in structure_indicators for word in last_words):
@@ -1175,8 +1185,12 @@ def stream_chat(
                 'to be continued', 'more on this', 'further details'
             ]
             
-            if any(indicator in text.lower()[-100:] for indicator in incomplete_section_indicators):
+            if any(indicator in text.lower()[-100:] for indicator in incomplete_section_indicators) and not is_substantial:
                 return False
+            
+            # If response is substantial and ends with proper punctuation, consider it complete
+            if is_substantial and any(text.rstrip().endswith(p) for p in ['.', '!', '?', ':', '\n']):
+                return True
             
             return not any(incomplete_indicators)
         
@@ -1356,16 +1370,83 @@ def stream_chat(
         # Check if response is complete
         is_complete = is_response_complete(final_text)
         
+        # Function to detect if continuation is repeating previous content
+        def is_continuation_repeating(previous_text, continuation_text):
+            """Detect if continuation is repeating previous content."""
+            if not continuation_text or len(continuation_text.strip()) < 50:
+                return False
+            
+            # Extract sentences/phrases from continuation
+            continuation_lower = continuation_text.lower().strip()
+            previous_lower = previous_text.lower().strip()
+            
+            # If continuation is very similar to previous text (high overlap), likely repeating
+            if len(continuation_lower) > 100 and len(previous_lower) > 100:
+                # Calculate word overlap
+                continuation_words = set(continuation_lower.split())
+                previous_words = set(previous_lower.split())
+                
+                # Filter out common words
+                common_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'}
+                continuation_words = {w for w in continuation_words if w not in common_words and len(w) > 3}
+                previous_words = {w for w in previous_words if w not in common_words and len(w) > 3}
+                
+                if len(continuation_words) > 0:
+                    overlap = len(continuation_words.intersection(previous_words))
+                    overlap_ratio = overlap / len(continuation_words)
+                    # If more than 50% of words overlap, likely repeating
+                    if overlap_ratio > 0.5:
+                        return True
+            
+            # Check for repeated sentences (exact matches)
+            continuation_sentences = [s.strip() for s in continuation_lower.split('.') if len(s.strip()) > 30]
+            previous_sentences = [s.strip() for s in previous_lower.split('.') if len(s.strip()) > 30]
+            
+            # Count how many continuation sentences appear in previous text
+            repeated_sentences = 0
+            for cont_sent in continuation_sentences[:5]:  # Check first 5 sentences
+                if len(cont_sent) > 40:  # Only check substantial sentences
+                    # Check if this sentence appears in previous text (exact match)
+                    if cont_sent in previous_lower:
+                        repeated_sentences += 1
+            
+            # If more than 40% of sentences are repeated, likely repeating
+            if len(continuation_sentences) > 0:
+                repetition_ratio = repeated_sentences / min(len(continuation_sentences), 5)
+                if repetition_ratio > 0.4:
+                    return True
+            
+            # Check for repeated long phrases (4+ word phrases)
+            continuation_words = continuation_lower.split()
+            if len(continuation_words) > 30:
+                repeated_phrases = 0
+                # Check for repeated 4-word phrases
+                for i in range(len(continuation_words) - 3):
+                    phrase = ' '.join(continuation_words[i:i+4])
+                    if len(phrase) > 20 and phrase in previous_lower:
+                        repeated_phrases += 1
+                        if repeated_phrases > 3:  # More than 3 repeated phrases
+                            return True
+            
+            return False
+        
         # Sequential generation: continue generating if response is incomplete
         # This allows the model to go beyond max_new_tokens to complete its answer
-        max_total_tokens = int(max_new_tokens * 3)  # Allow up to 3x max_new_tokens total
+        max_total_tokens = int(max_new_tokens * 5)  # Allow up to 5x max_new_tokens total (increased)
         continuation_chunk_size = int(max_new_tokens * 0.5)  # Generate 50% more tokens each continuation
         total_tokens_generated = chunk_count  # Approximate from chunks
         continuation_count = 0
-        max_continuations = 3  # Reduced from 5 to prevent excessive hallucination
+        max_continuations = 10  # Increased to allow more continuations if on-topic
         original_response_before_continuation = final_text  # Store original response
+        previous_continuation_texts = []  # Track previous continuations to detect repetition
         
-        while not is_complete and continuation_count < max_continuations and total_tokens_generated < max_total_tokens:
+        # Continue as long as response is incomplete, on-topic, not repeating, and within limits
+        while continuation_count < max_continuations and total_tokens_generated < max_total_tokens:
+            # Check if we should continue (incomplete and not repeating)
+            if is_complete:
+                logger.info(f"Response is complete - stopping continuation")
+                break
+            
             continuation_count += 1
             logger.info(f"Response incomplete - continuing generation (continuation {continuation_count}/{max_continuations})")
             
@@ -1573,6 +1654,31 @@ def stream_chat(
                         # If it's off-plan but still on-topic, accept it (might be natural continuation)
                         logger.info(f"Accepting continuation {continuation_count} - off-plan but on-topic")
             
+            # Check for repetition - if continuation is repeating previous content, stop
+            is_repeating = False
+            if previous_continuation_texts:
+                # Check if this continuation repeats any previous continuation
+                for prev_cont in previous_continuation_texts[-2:]:  # Check last 2 continuations
+                    if is_continuation_repeating(prev_cont, continuation_clean):
+                        logger.warning(f"Continuation {continuation_count} is repeating previous content - stopping")
+                        is_repeating = True
+                        break
+            
+            # Also check if continuation repeats the original response
+            if not is_repeating and len(continuation_clean) > 100:
+                if is_continuation_repeating(original_response_before_continuation, continuation_clean):
+                    logger.warning(f"Continuation {continuation_count} is repeating original response - stopping")
+                    is_repeating = True
+            
+            if is_repeating:
+                # Revert to state before this continuation
+                final_text = partial_response  # partial_response already has previous continuations
+                is_complete = True  # Mark as complete to stop
+                break
+            
+            # Store this continuation for repetition checking
+            previous_continuation_texts.append(continuation_clean)
+            
             # Check if continuation is complete
             is_complete = is_response_complete(final_text)
             
@@ -1582,6 +1688,20 @@ def stream_chat(
             if continuation_chunk_count < 10:
                 logger.info("Continuation produced very few tokens, assuming complete")
                 is_complete = True
+            
+            # Check if we have enough information (response is substantial)
+            # If response is very long (>5000 chars) and seems complete enough, mark as complete
+            if len(final_text) > 5000 and not is_complete:
+                # Check if last 200 chars suggest completion
+                last_200 = final_text[-200:].lower()
+                completion_indicators = [
+                    'conclusion', 'summary', 'in summary', 'to summarize',
+                    'important note', 'remember', 'always consult',
+                    'consult your', 'see your doctor', 'seek medical'
+                ]
+                if any(indicator in last_200 for indicator in completion_indicators):
+                    logger.info(f"Response is substantial ({len(final_text)} chars) and has completion indicators - marking as complete")
+                    is_complete = True
         
         if continuation_count > 0:
             logger.info(f"Sequential generation complete after {continuation_count} continuation(s). Total response: {len(final_text)} chars")
