@@ -2339,8 +2339,67 @@ def _stream_chat_impl(
                     'wants to know more', 'what are you looking for now'
                 ]):
                     continue
+                
+                # Skip warnings and non-relevant content (HTML, formatting, code, system messages)
+                warning_patterns = [
+                    # HTML/formatting warnings
+                    'html code contains', 'html code', 'contains text that was likely',
+                    'intended to create a table', 'intended to create', 'list item',
+                    'however, there isn', 'the above html', 'above html code',
+                    'likely intended', 'was likely intended', '/sup>', '</sup>',
+                    'html warning', 'html error', 'html issue',
+                    # Markdown/formatting warnings
+                    'markdown code', 'markdown warning', 'formatting error',
+                    'syntax error', 'parsing error', 'parsing warning',
+                    # Code/technical warnings
+                    'code contains', 'code error', 'code warning', 'code issue',
+                    'invalid syntax', 'syntax warning', 'formatting issue',
+                    # System/debug messages
+                    'system message', 'debug message', 'warning:', 'error:',
+                    'note: this', 'note: the', 'warning: the', 'error: the',
+                    'caution:', 'alert:', 'notice:',
+                    # Parsing/validation warnings
+                    'parsing failed', 'validation error', 'validation warning',
+                    'invalid format', 'format error', 'format warning',
+                    # Generic warning patterns
+                    'this is a warning', 'this is an error', 'this is a note',
+                    'please note that', 'note that this', 'warning: this',
+                    'error: this', 'issue: this', 'problem: this',
+                    # Technical error messages
+                    'traceback', 'exception', 'stack trace', 'runtime error',
+                    'compilation error', 'execution error',
+                ]
+                if any(pattern in line_lower for pattern in warning_patterns):
+                    continue
+                
                 filtered_lines.append(line)
+            
             continuation_clean = '\n'.join(filtered_lines).strip()
+            
+            # Remove warning patterns using regex (catches anywhere in text)
+            warning_regex = [
+                # HTML warnings
+                r'["\']?/sup>.*?html code.*?contains.*?text.*?likely.*?intended',
+                r'html code contains text that was likely intended',
+                r'the above html code contains.*?intended to create',
+                r'intended to create a table or list item.*?however.*?there isn',
+                # Formatting warnings
+                r'markdown code.*?contains.*?text.*?likely',
+                r'formatting error.*?invalid.*?syntax',
+                r'parsing error.*?failed.*?parse',
+                # System messages
+                r'warning:\s*this.*?error',
+                r'error:\s*this.*?warning',
+                r'note:\s*this.*?warning',
+                r'system message.*?debug',
+                # Technical errors
+                r'traceback.*?exception',
+                r'runtime error.*?execution',
+                r'compilation error.*?syntax',
+            ]
+            for pattern in warning_regex:
+                continuation_clean = re.sub(pattern, '', continuation_clean, flags=re.I | re.DOTALL)
+            continuation_clean = continuation_clean.strip()
             
             # Deduplication: Remove duplicate content using semantic similarity
             # Check if continuation is repeating previous content
@@ -2539,6 +2598,75 @@ def _stream_chat_impl(
             ]
             for token_str in special_token_strings:
                 final_text = final_text.replace(token_str, "")
+            
+            # Remove warnings and non-relevant content
+            # First, remove warning patterns using regex (catches anywhere in text)
+            warning_regex = [
+                # HTML warnings
+                r'["\']?/sup>.*?html code.*?contains.*?text.*?likely.*?intended',
+                r'html code contains text that was likely intended',
+                r'the above html code contains.*?intended to create',
+                r'intended to create a table or list item.*?however.*?there isn',
+                r'html.*?warning.*?error.*?issue',
+                # Formatting warnings
+                r'markdown code.*?contains.*?text.*?likely',
+                r'formatting error.*?invalid.*?syntax',
+                r'parsing error.*?failed.*?parse',
+                # System messages
+                r'warning:\s*this.*?error',
+                r'error:\s*this.*?warning',
+                r'note:\s*this.*?warning',
+                r'system message.*?debug',
+                # Technical errors
+                r'traceback.*?exception',
+                r'runtime error.*?execution',
+                r'compilation error.*?syntax',
+            ]
+            for pattern in warning_regex:
+                final_text = re.sub(pattern, '', final_text, flags=re.I | re.DOTALL)
+            
+            # Then filter lines that contain warning patterns
+            lines = final_text.split('\n')
+            filtered_lines = []
+            for line in lines:
+                line_lower = line.lower().strip()
+                warning_patterns = [
+                    # HTML/formatting warnings
+                    'html code contains', 'html code', 'contains text that was likely',
+                    'intended to create a table', 'intended to create', 'list item',
+                    'however, there isn', 'the above html', 'above html code',
+                    'likely intended', 'was likely intended', '/sup>', '</sup>',
+                    'html warning', 'html error', 'html issue',
+                    # Markdown/formatting warnings
+                    'markdown code', 'markdown warning', 'formatting error',
+                    'syntax error', 'parsing error', 'parsing warning',
+                    # Code/technical warnings
+                    'code contains', 'code error', 'code warning', 'code issue',
+                    'invalid syntax', 'syntax warning', 'formatting issue',
+                    # System/debug messages
+                    'system message', 'debug message', 'warning:', 'error:',
+                    'note: this', 'note: the', 'warning: the', 'error: the',
+                    'caution:', 'alert:', 'notice:',
+                    # Parsing/validation warnings
+                    'parsing failed', 'validation error', 'validation warning',
+                    'invalid format', 'format error', 'format warning',
+                    # Generic warning patterns
+                    'this is a warning', 'this is an error', 'this is a note',
+                    'please note that', 'note that this', 'warning: this',
+                    'error: this', 'issue: this', 'problem: this',
+                    # Technical error messages
+                    'traceback', 'exception', 'stack trace', 'runtime error',
+                    'compilation error', 'execution error',
+                ]
+                if any(pattern in line_lower for pattern in warning_patterns):
+                    continue
+                filtered_lines.append(line)
+            final_text = '\n'.join(filtered_lines).strip()
+            
+            # Clean up any leftover double spaces or empty lines
+            final_text = re.sub(r'\n\s*\n\s*\n', '\n\n', final_text)  # Max 2 consecutive newlines
+            final_text = re.sub(r'[ \t]{2,}', ' ', final_text)  # Collapse multiple spaces
+            
             final_text = _clean_leading_filler(_strip_disclaimers(final_text))
         
         # Save final cache before yielding
