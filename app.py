@@ -847,8 +847,34 @@ def stream_chat(
             self.stop_event = stop_event
         def __call__(self, input_ids, scores, **kwargs):
             return self.stop_event.is_set()
+    
+    class IgnoreEOSUntilMinTokens(StoppingCriteria):
+        """Prevent stopping on EOS token until we reach a minimum number of tokens.
+        
+        This works by checking if EOS token is generated before the minimum threshold.
+        If so, we replace it with a different token to prevent stopping.
+        However, since we can't modify tokens in stopping criteria, we'll use a different approach:
+        We'll temporarily set eos_token_id to None in generation kwargs.
+        """
+        def __init__(self, eos_token_id, min_tokens_to_ignore_eos, prompt_length):
+            super().__init__()
+            self.eos_token_id = eos_token_id
+            self.min_tokens_to_ignore_eos = min_tokens_to_ignore_eos
+            self.prompt_length = prompt_length
+        
+        def __call__(self, input_ids, scores, **kwargs):
+            # Calculate how many new tokens have been generated
+            new_tokens_count = input_ids.shape[-1] - self.prompt_length
+            
+            # If we haven't reached the minimum threshold and EOS is generated, prevent stopping
+            # Note: We can't actually prevent EOS stopping here, but we can log it
+            if new_tokens_count < self.min_tokens_to_ignore_eos:
+                if input_ids[0, -1].item() == self.eos_token_id:
+                    logger.warning(f"EOS token generated at {new_tokens_count} tokens (min: {self.min_tokens_to_ignore_eos}), but stopping criteria cannot prevent it")
+            
+            # Never stop based on this criteria alone - let other criteria handle stopping
+            return False
 
-    stopping_criteria = StoppingCriteriaList([StopOnEvent(stop_event)])
     # Don't skip special tokens - they're important for proper decoding, especially for non-English languages
     # skip_special_tokens=False ensures Vietnamese and other languages decode correctly
     # Use timeout=None to ensure streamer doesn't stop prematurely
@@ -895,22 +921,51 @@ def stream_chat(
         pad_id = global_tokenizer.eos_token_id
     eos_id = global_tokenizer.eos_token_id
     
+    # Calculate prompt length for the stopping criteria
+    prompt_length = enc['input_ids'].shape[-1] if isinstance(enc, dict) else enc.input_ids.shape[-1]
+    
+    # Set minimum tokens before allowing EOS to stop (use 80% of max_new_tokens or min_tokens, whichever is higher)
+    # This prevents the model from stopping too early on EOS tokens
+    min_tokens_before_eos = max(min_tokens, int(max_new_tokens * 0.80))
+    
+    # Create stopping criteria list with both custom criteria
+    stopping_criteria = StoppingCriteriaList([
+        StopOnEvent(stop_event),
+        IgnoreEOSUntilMinTokens(eos_id, min_tokens_before_eos, prompt_length)
+    ])
+    
     # Configure stop sequences to prevent premature stopping
     # Don't stop on common mid-sentence patterns that might appear in medical text
     stop_sequences = None  # Let the model use its natural EOS token
+    
+    # IMPORTANT: To prevent premature EOS stopping, we temporarily set eos_token_id to None.
+    # This prevents the model from stopping early on EOS tokens.
+    # The model will generate until max_new_tokens is reached, which ensures complete responses.
+    # We rely on max_new_tokens to stop generation, not EOS tokens.
+    # This is safe because max_new_tokens will always stop generation at the limit.
+    
+    # Temporarily disable EOS token stopping to prevent premature stopping
+    # The model will generate until max_new_tokens is reached
+    generation_eos_token_id = None  # Disable EOS stopping to prevent premature stopping
+    
+    # Use the higher min_new_tokens threshold
+    effective_min_tokens = min_tokens_before_eos
+    
+    logger.info(f"Generation config: max_new_tokens={max_new_tokens}, min_new_tokens={effective_min_tokens}, eos_token_id={generation_eos_token_id} (disabled)")
+    logger.info(f"EOS token stopping disabled - model will generate until max_new_tokens ({max_new_tokens}) is reached")
     
     generation_kwargs = dict(
         **enc,
         streamer=streamer,
         max_new_tokens=int(max_new_tokens),
-        min_new_tokens=min_tokens,
+        min_new_tokens=effective_min_tokens,  # Use the higher threshold to prevent early EOS stopping
         do_sample=use_sampling,
         repetition_penalty=max(1.1, float(penalty)),
         no_repeat_ngram_size=4,
         use_cache=True,
         stopping_criteria=stopping_criteria,
         bad_words_ids=bad_words_ids,
-        eos_token_id=eos_id,
+        eos_token_id=generation_eos_token_id,  # Keep EOS token
         pad_token_id=pad_id,
     )
     
