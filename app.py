@@ -1119,18 +1119,15 @@ def stream_chat(
         def is_response_complete(text):
             """Check if the response seems complete or incomplete.
             
-            This should be less strict - if response is substantial and on-topic,
-            we should allow continuation even if it seems incomplete.
+            This should be accurate - check for real incomplete patterns,
+            not just punctuation. A response can end with punctuation but still be incomplete.
             """
             if not text or len(text.strip()) < 10:
                 return False
             
             text = text.strip()
             
-            # If response is very long (>3000 chars), be more lenient about completeness
-            is_substantial = len(text) > 3000
-            
-            # Check for incomplete indicators
+            # Check for incomplete indicators (these always indicate incompleteness)
             incomplete_indicators = [
                 text.endswith(','),
                 text.endswith(';'),
@@ -1142,57 +1139,90 @@ def stream_chat(
                 text.endswith(' to'),
                 text.endswith(' the'),
                 # Check if last sentence is incomplete (no period, exclamation, or question mark)
-                # But be more lenient if response is substantial
-                len(text) > 50 and not any(text.rstrip().endswith(p) for p in ['.', '!', '?', ':', '\n']) and not is_substantial
+                len(text) > 50 and not any(text.rstrip().endswith(p) for p in ['.', '!', '?', ':', '\n', ')', ']', '}'])
             ]
             
-            # Also check if response seems to be cut off mid-word or mid-sentence
-            # Look for patterns like ending with lowercase letters followed by nothing
+            # If any incomplete indicator is present, definitely incomplete
+            if any(incomplete_indicators):
+                return False
+            
+            # Check if response seems to be cut off mid-word or mid-sentence
             if len(text) > 100:
                 text_rstrip = text.rstrip()
                 if len(text_rstrip) > 0:
                     last_char = text_rstrip[-1]
                     # If ends with lowercase and no punctuation, might be incomplete
-                    # But be more lenient if response is substantial
                     if last_char not in ['.', '!', '?', ':', '\n', ')', ']', '}']:
                         # Check if it looks like mid-sentence
-                        if not last_char.isupper() and not any(incomplete_indicators) and not is_substantial:
+                        if not last_char.isupper():
                             # Might be incomplete if it doesn't end with proper punctuation
                             return False
             
             # Check if answer structure/plan seems complete
             # Look for patterns that suggest the answer is still in progress
             structure_indicators = [
-                '1.', '2.', '3.', '4.', '5.',  # Numbered lists
+                '1.', '2.', '3.', '4.', '5.', '6.', '7.', '8.', '9.',  # Numbered lists
                 'first', 'second', 'third', 'fourth', 'fifth',  # Ordinal numbers
                 'next', 'then', 'finally', 'lastly',  # Sequence indicators
                 'also', 'additionally', 'furthermore', 'moreover'  # Continuation words
             ]
             
-            # If text ends with a structure indicator or continuation word, might be incomplete
-            # But be more lenient if response is substantial
-            last_50_chars = text[-50:].lower()
-            if any(indicator in last_50_chars for indicator in structure_indicators) and not is_substantial:
-                # Check if it's actually ending with these words (incomplete)
-                last_words = text.split()[-3:]
-                if any(word.lower() in structure_indicators for word in last_words):
+            # Check if text ends with a structure indicator or continuation word
+            last_100_chars = text[-100:].lower()
+            last_words = text.split()[-5:]  # Check last 5 words
+            
+            # If ends with structure indicator, likely incomplete
+            for word in last_words:
+                if word.lower().rstrip('.,;:!?') in structure_indicators:
                     # Ending with structure indicator - likely incomplete
                     return False
+            
+            # Check for incomplete list items (ending with bullet points or numbers)
+            if text.endswith(('*', '-', '•', '1.', '2.', '3.', '4.', '5.')):
+                return False
             
             # Check if response mentions incomplete sections
             incomplete_section_indicators = [
                 'will be discussed', 'will be covered', 'will be explained',
-                'to be continued', 'more on this', 'further details'
+                'to be continued', 'more on this', 'further details',
+                'more information', 'additional details'
             ]
             
-            if any(indicator in text.lower()[-100:] for indicator in incomplete_section_indicators) and not is_substantial:
+            if any(indicator in text.lower()[-150:] for indicator in incomplete_section_indicators):
                 return False
             
-            # If response is substantial and ends with proper punctuation, consider it complete
-            if is_substantial and any(text.rstrip().endswith(p) for p in ['.', '!', '?', ':', '\n']):
+            # Check for incomplete HTML/list structures (like ending with </li> or <ul>)
+            if text.rstrip().endswith(('</li>', '<ul>', '<ol>', '<li>', '</ul>', '</ol>')):
+                return False
+            
+            # Check if response ends mid-word (very short last word suggests cutoff)
+            last_word = text.split()[-1] if text.split() else ''
+            if len(last_word) < 3 and len(text) > 100:
+                # Very short last word might indicate cutoff
+                return False
+            
+            # If we get here, response seems complete
+            # But only if it ends with proper punctuation AND seems finished
+            if any(text.rstrip().endswith(p) for p in ['.', '!', '?', ':', '\n', ')', ']', '}']):
+                # Additional check: make sure it's not ending mid-sentence
+                # Check if last sentence is complete (has subject and verb)
+                last_sentence = text.split('.')[-1].strip() if '.' in text else text.split()[-10:]
+                if isinstance(last_sentence, list):
+                    last_sentence = ' '.join(last_sentence)
+                
+                # If last sentence is very short (<10 chars), might be incomplete
+                if len(last_sentence) < 10:
+                    return False
+                
+                # If last sentence doesn't have proper structure, might be incomplete
+                # Check if it has at least 3 words (subject, verb, object)
+                if len(last_sentence.split()) < 3:
+                    return False
+                
                 return True
             
-            return not any(incomplete_indicators)
+            # If no proper punctuation, definitely incomplete
+            return False
         
         # Function to extract answer structure/plan from original response
         def extract_answer_structure(text):
@@ -1369,6 +1399,12 @@ def stream_chat(
         
         # Check if response is complete
         is_complete = is_response_complete(final_text)
+        
+        # Log completeness check result for debugging
+        if is_complete:
+            logger.info(f"Response marked as complete: {len(final_text)} chars, ends with: '{final_text[-50:]}'")
+        else:
+            logger.info(f"Response marked as incomplete: {len(final_text)} chars, ends with: '{final_text[-50:]}'")
         
         # Function to detect if continuation is repeating previous content
         def is_continuation_repeating(previous_text, continuation_text):
@@ -1681,6 +1717,12 @@ def stream_chat(
             
             # Check if continuation is complete
             is_complete = is_response_complete(final_text)
+            
+            # Log completeness check result for debugging
+            if is_complete:
+                logger.info(f"Continuation {continuation_count} marked as complete: {len(final_text)} chars, ends with: '{final_text[-50:]}'")
+            else:
+                logger.info(f"Continuation {continuation_count} marked as incomplete: {len(final_text)} chars, ends with: '{final_text[-50:]}'")
             
             logger.info(f"Continuation {continuation_count} complete: {len(continuation_clean)} chars (cleaned from {len(continuation_text)}), {continuation_chunk_count} chunks. Total: {len(final_text)} chars. Complete: {is_complete}")
             
