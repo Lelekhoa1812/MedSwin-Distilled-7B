@@ -195,8 +195,8 @@ class GeminiClient:
             raise ImportError("google-genai package is not installed. Install with: pip install google-genai")
         self.client = genai.Client(api_key=api_key)
     
-    def generate_content(self, prompt: str, model: str = "gemini-2.5-flash", temperature: float = 0.7) -> str:
-        """Generate content using Gemini API"""
+    def generate_content(self, prompt: str, model: str = "gemini-2.5-flash") -> str:
+        """Generate content using Gemini API (no config params like temperature)"""
         try:
             response = self.client.models.generate_content(model=model, contents=prompt)
             return response.text
@@ -858,6 +858,181 @@ def _create_or_update_index_impl(files, request: gr.Request):
     return f"Successfully indexed {len(files)} files.", output_container
 
 
+def gemini_chat(
+    message: str,
+    history: list,
+    system_prompt: str,
+    disable_retrieval: bool,
+    retriever_k: int,
+    merge_threshold: float,
+    request: gr.Request
+):
+    """Gemini API chat function (no GPU needed, no config params)"""
+    # --- guards & basics ---
+    if not request:
+        model_status = "Session initialization failed"
+        yield history + [{"role": "assistant", "content": "Session initialization failed. Please refresh the page."}], model_status
+        return
+    
+    global gemini_client
+    if gemini_client is None:
+        model_status = "Gemini client not initialized"
+        yield history + [{"role": "assistant", "content": "Gemini client not initialized. Please select Gemini Flash model."}], model_status
+        return
+    
+    user_id = request.session_hash
+    index_dir = f"./{user_id}_index"
+    
+    # normalize UI params
+    retriever_k = int(retriever_k) if isinstance(retriever_k, (int, float)) else 15
+    merge_threshold = float(merge_threshold) if isinstance(merge_threshold, (int, float)) else 0.5
+    
+    # --- language detection ---
+    detected_lang = _detect_language(message)
+    logger.info(f"[language] detected={detected_lang} for query: {message[:50]}...")
+    
+    # --- retrieval (optional) ---
+    context = ""
+    source_info = ""
+    try:
+        if not disable_retrieval:
+            if not os.path.exists(index_dir):
+                model_status = "No documents uploaded"
+                yield history + [{"role": "assistant", "content":
+                    "Please upload documents first or enable 'Disable document retrieval' to chat without documents."}], model_status
+                return
+
+            # Use global embedding model (loaded at startup) - this is separate from LLM model
+            global global_embedding_model
+            if global_embedding_model is None:
+                initialize_embedding_model()
+            embed_model = global_embedding_model
+            Settings.embed_model = embed_model
+
+            storage_context = StorageContext.from_defaults(persist_dir=index_dir)
+            index = load_index_from_storage(storage_context, settings=Settings)
+
+            base_retriever = index.as_retriever(similarity_top_k=retriever_k)
+            auto_merging_retriever = AutoMergingRetriever(
+                base_retriever,
+                storage_context=storage_context,
+                simple_ratio_thresh=merge_threshold, 
+                verbose=True
+            )
+
+            logger.info(f"[query] {message}")
+            t0 = time.time()
+            base_nodes = base_retriever.retrieve(message)
+            logger.info(f"[retrieval] base={len(base_nodes)} in {time.time()-t0:.2f}s")
+
+            t1 = time.time()
+            merged_nodes = auto_merging_retriever.retrieve(message)
+            logger.info(f"[retrieval] merged={len(merged_nodes)} in {time.time()-t1:.2f}s")
+
+            # For Vietnamese queries, be more selective with context to avoid hallucinations
+            if detected_lang == 'vi':
+                merged_nodes = merged_nodes[:min(5, len(merged_nodes))]
+                logger.info(f"[retrieval] Vietnamese query - limiting to top {len(merged_nodes)} nodes")
+            
+            # merge text + normalize + truncate by characters (no tokenizer needed for Gemini)
+            context = "\n\n".join([(n.node.text or "") for n in merged_nodes])
+            context = _normalize_text(context)
+            
+            # For Vietnamese, use less context to avoid confusion
+            max_context_tokens = 1200 if detected_lang == 'vi' else 1800
+            # Truncate by characters (rough estimate: 4 chars per token)
+            max_context_chars = max_context_tokens * 4
+            if len(context) > max_context_chars:
+                context = context[-max_context_chars:]
+
+            # compact source list
+            srcs = []
+            for n in merged_nodes:
+                md = getattr(n.node, "metadata", {}) or {}
+                fn = md.get("file_name")
+                if fn and fn not in srcs:
+                    srcs.append(fn)
+            if srcs:
+                source_info = "\n\n[Sources] " + ", ".join(srcs)
+    except Exception as e:
+        logger.exception(f"retrieval error: {e}")
+        # fallback to no context rather than failing the chat
+        context, source_info = "", ""
+
+    # --- Build prompt for Gemini (same prompting logic as before) ---
+    sys_text = (system_prompt or "").strip()
+    
+    # Handle system prompt based on language and whether RAG is enabled
+    if detected_lang == 'vi':
+        if context:
+            sys_text = f"{sys_text}\n\n[Lưu ý: Chỉ sử dụng thông tin từ ngữ cảnh tài liệu nếu nó liên quan trực tiếp đến câu hỏi.]\n\n[Document Context]\n{context}{source_info}"
+        else:
+            sys_text = f"{sys_text}\n\n[Lưu ý: Trả lời bằng tiếng Việt dựa trên kiến thức y tế của bạn.]"
+    else:
+        if context:
+            sys_text = f"{sys_text}\n\n[Document Context]\n{context}{source_info}"
+        elif disable_retrieval:
+            sys_text = f"{sys_text}\n\n[Note: Answer based on your medical knowledge.]"
+    
+    # Build conversation messages for Gemini
+    convo_msgs = [{"role": "system", "content": sys_text}]
+    
+    # Add filtered history
+    if history:
+        max_history = 2 if detected_lang == 'vi' else 4
+        recent_history = history[-max_history:] if len(history) > max_history else history
+        for m in recent_history:
+            if m and isinstance(m, dict) and m.get("role") in ("user", "assistant"):
+                content = m.get("content", "").strip()
+                if len(content) > 5:
+                    if detected_lang == 'vi':
+                        hist_lang = _detect_language(content)
+                        if hist_lang == 'vi':
+                            convo_msgs.append({"role": m["role"], "content": content})
+                    else:
+                        convo_msgs.append({"role": m["role"], "content": content})
+    
+    # Add current message
+    convo_msgs.append({"role": "user", "content": message})
+    
+    # Build simple prompt for Gemini API
+    prompt_parts = []
+    for msg in convo_msgs:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role == "system":
+            prompt_parts.append(f"System: {content}")
+        elif role == "user":
+            prompt_parts.append(f"User: {content}")
+        elif role == "assistant":
+            prompt_parts.append(f"Assistant: {content}")
+    gemini_prompt = "\n\n".join(prompt_parts)
+    
+    # Generate response using Gemini API (non-streaming, complete response, no config params)
+    try:
+        model_status = "Gemini is generating answer..."
+        updated_history = history + [{"role": "user", "content": message}, {"role": "assistant", "content": ""}]
+        yield updated_history, model_status
+        
+        response = gemini_client.generate_content(
+            prompt=gemini_prompt,
+            model="gemini-2.5-flash"
+        )
+        
+        # Return the complete response
+        updated_history[-1]["content"] = response
+        model_status = "Gemini complete answer generation"
+        yield updated_history, model_status
+        return
+    except Exception as e:
+        logger.error(f"Gemini generation error: {e}")
+        error_msg = f"Error generating response from Gemini: {str(e)}"
+        updated_history = history + [{"role": "user", "content": message}, {"role": "assistant", "content": error_msg}]
+        model_status = "Gemini generation failed"
+        yield updated_history, model_status
+        return
+
+
 @spaces.GPU(max_duration=120)
 def stream_chat(
     message: str,
@@ -874,6 +1049,17 @@ def stream_chat(
     request: gr.Request
 ):
     """Stream chat with retry logic and caching for GPU abort recovery."""
+    # Check if Gemini is selected - route to gemini_chat (no GPU needed)
+    global gemini_client
+    if gemini_client is not None:
+        # Route to Gemini function (no GPU decorator, no config params)
+        for result in gemini_chat(
+            message, history, system_prompt, disable_retrieval,
+            retriever_k, merge_threshold, request
+        ):
+            yield result
+        return
+    
     # --- guards & basics ---
     if not request:
         yield history + [{"role": "assistant", "content": "Session initialization failed. Please refresh the page."}]
@@ -1041,15 +1227,9 @@ def _stream_chat_impl(
     retriever_k    = int(retriever_k)    if isinstance(retriever_k,  (int, float)) else 15
     merge_threshold= float(merge_threshold) if isinstance(merge_threshold, (int, float)) else 0.5
 
-    # Check if Gemini is selected (completely API-based, no local model needed)
-    global gemini_client
-    use_gemini = gemini_client is not None
-    
-    # Only initialize HuggingFace model/tokenizer if NOT using Gemini
-    if not use_gemini:
-        # ensure model/tokenizer exist (uses currently selected MODEL) - only for HuggingFace models
-        if global_model is None or global_tokenizer is None:
-            initialize_model_and_tokenizer(MODEL)
+    # ensure model/tokenizer exist (uses currently selected MODEL) - only for HuggingFace models
+    if global_model is None or global_tokenizer is None:
+        initialize_model_and_tokenizer(MODEL)
 
     # --- language detection ---
     detected_lang = _detect_language(message)
@@ -1106,14 +1286,8 @@ def _stream_chat_impl(
             
             # For Vietnamese, use less context to avoid confusion
             max_context_tokens = 1200 if detected_lang == 'vi' else 1800
-            # Handle truncation: use tokenizer if available (HuggingFace models), otherwise truncate by characters (Gemini)
-            if not use_gemini and global_tokenizer is not None:
-                context = _truncate_by_tokens(context, global_tokenizer, max_tokens=max_context_tokens)
-            else:
-                # For Gemini (API-based), truncate by characters (rough estimate: 4 chars per token)
-                max_context_chars = max_context_tokens * 4
-                if len(context) > max_context_chars:
-                    context = context[-max_context_chars:]
+            # Truncate by tokens using tokenizer (HuggingFace models only)
+            context = _truncate_by_tokens(context, global_tokenizer, max_tokens=max_context_tokens)
 
             # compact source list
             srcs = []
@@ -1129,83 +1303,7 @@ def _stream_chat_impl(
         # fallback to no context rather than failing the chat
         context, source_info = "", ""
 
-    # --- Handle Gemini API (completely separate path, no local model dependencies) ---
-    if use_gemini:
-        # Build prompt for Gemini (simple format, no HuggingFace dependencies)
-        sys_text = (system_prompt or "").strip()
-        
-        # Handle system prompt based on language and whether RAG is enabled
-        if detected_lang == 'vi':
-            if context:
-                sys_text = f"{sys_text}\n\n[Lưu ý: Chỉ sử dụng thông tin từ ngữ cảnh tài liệu nếu nó liên quan trực tiếp đến câu hỏi.]\n\n[Document Context]\n{context}{source_info}"
-            else:
-                sys_text = f"{sys_text}\n\n[Lưu ý: Trả lời bằng tiếng Việt dựa trên kiến thức y tế của bạn.]"
-        else:
-            if context:
-                sys_text = f"{sys_text}\n\n[Document Context]\n{context}{source_info}"
-            elif disable_retrieval:
-                sys_text = f"{sys_text}\n\n[Note: Answer based on your medical knowledge.]"
-        
-        # Build conversation messages for Gemini
-        convo_msgs = [{"role": "system", "content": sys_text}]
-        
-        # Add filtered history
-        if history:
-            max_history = 2 if detected_lang == 'vi' else 4
-            recent_history = history[-max_history:] if len(history) > max_history else history
-            for m in recent_history:
-                if m and isinstance(m, dict) and m.get("role") in ("user", "assistant"):
-                    content = m.get("content", "").strip()
-                    if len(content) > 5:
-                        if detected_lang == 'vi':
-                            hist_lang = _detect_language(content)
-                            if hist_lang == 'vi':
-                                convo_msgs.append({"role": m["role"], "content": content})
-                        else:
-                            convo_msgs.append({"role": m["role"], "content": content})
-        
-        # Add current message
-        convo_msgs.append({"role": "user", "content": message})
-        
-        # Build simple prompt for Gemini API
-        prompt_parts = []
-        for msg in convo_msgs:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            if role == "system":
-                prompt_parts.append(f"System: {content}")
-            elif role == "user":
-                prompt_parts.append(f"User: {content}")
-            elif role == "assistant":
-                prompt_parts.append(f"Assistant: {content}")
-        gemini_prompt = "\n\n".join(prompt_parts)
-        
-        # Generate response using Gemini API (non-streaming, complete response)
-        try:
-            model_status = "Gemini is generating answer..."
-            updated_history = history + [{"role": "user", "content": message}, {"role": "assistant", "content": ""}]
-            yield updated_history, model_status
-            
-            response = gemini_client.generate_content(
-                prompt=gemini_prompt,
-                model="gemini-2.5-flash",
-                temperature=float(temperature)
-            )
-            
-            # Return the complete response
-            updated_history[-1]["content"] = response
-            model_status = "Gemini complete answer generation"
-            yield updated_history, model_status
-            return
-        except Exception as e:
-            logger.error(f"Gemini generation error: {e}")
-            error_msg = f"Error generating response from Gemini: {str(e)}"
-            updated_history = history + [{"role": "user", "content": message}, {"role": "assistant", "content": error_msg}]
-            model_status = "Gemini generation failed"
-            yield updated_history, model_status
-            return
-
-    # --- HuggingFace model path (only if NOT using Gemini) ---
+    # --- HuggingFace model path ---
     # --- prompt building (template-aware) ---
     sys_text = (system_prompt or "").strip()
     
