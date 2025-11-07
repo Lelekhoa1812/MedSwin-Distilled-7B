@@ -1151,7 +1151,179 @@ def stream_chat(
                             # Might be incomplete if it doesn't end with proper punctuation
                             return False
             
+            # Check if answer structure/plan seems complete
+            # Look for patterns that suggest the answer is still in progress
+            structure_indicators = [
+                '1.', '2.', '3.', '4.', '5.',  # Numbered lists
+                'first', 'second', 'third', 'fourth', 'fifth',  # Ordinal numbers
+                'next', 'then', 'finally', 'lastly',  # Sequence indicators
+                'also', 'additionally', 'furthermore', 'moreover'  # Continuation words
+            ]
+            
+            # If text ends with a structure indicator or continuation word, might be incomplete
+            last_50_chars = text[-50:].lower()
+            if any(indicator in last_50_chars for indicator in structure_indicators):
+                # Check if it's actually ending with these words (incomplete)
+                last_words = text.split()[-3:]
+                if any(word.lower() in structure_indicators for word in last_words):
+                    # Ending with structure indicator - likely incomplete
+                    return False
+            
+            # Check if response mentions incomplete sections
+            incomplete_section_indicators = [
+                'will be discussed', 'will be covered', 'will be explained',
+                'to be continued', 'more on this', 'further details'
+            ]
+            
+            if any(indicator in text.lower()[-100:] for indicator in incomplete_section_indicators):
+                return False
+            
             return not any(incomplete_indicators)
+        
+        # Function to extract answer structure/plan from original response
+        def extract_answer_structure(text):
+            """Extract the structure/plan of the answer (headings, numbered lists, etc.)."""
+            if not text:
+                return []
+            
+            structure = []
+            lines = text.split('\n')
+            
+            for line in lines:
+                line = line.strip()
+                # Detect headings (lines starting with numbers, letters, or common heading patterns)
+                if line and (line[0].isdigit() or line[0].isupper() or 
+                            line.startswith('#') or line.startswith('**') or
+                            any(line.startswith(prefix) for prefix in ['1.', '2.', '3.', '4.', '5.', '-', '*'])):
+                    # Extract first few words as structure element
+                    words = line.split()[:5]
+                    if words:
+                        structure.append(' '.join(words).lower())
+            
+            return structure
+        
+        # Function to detect if continuation is off-topic or hallucinating
+        def is_continuation_off_topic(original_text, continuation_text, original_message):
+            """Detect if continuation text is off-topic or hallucinating."""
+            if not continuation_text or len(continuation_text.strip()) < 20:
+                return False
+            
+            continuation_lower = continuation_text.lower()
+            original_lower = original_text.lower()
+            message_lower = original_message.lower()
+            
+            # Extract key medical/context words from original message and response
+            medical_keywords = [
+                'medical', 'health', 'treatment', 'patient', 'symptom', 'diagnosis',
+                'medication', 'therapy', 'clinical', 'disease', 'condition', 'disorder',
+                'migraine', 'headache', 'pain', 'chronic', 'acute', 'preventive',
+                'pharmacological', 'dosage', 'side effect', 'contraindication', 'drug',
+                'prescription', 'dosage', 'mg', 'tablet', 'capsule', 'injection',
+                'preventive', 'prophylactic', 'abortive', 'rescue', 'maintenance'
+            ]
+            
+            # Extract topic keywords from original message
+            message_words = set(message_lower.split())
+            original_words = set(original_lower.split()[:100])  # First 100 words
+            
+            # Check if continuation contains medical keywords from original context
+            continuation_has_medical = any(keyword in continuation_lower for keyword in medical_keywords)
+            original_has_medical = any(keyword in original_lower for keyword in medical_keywords)
+            
+            # Check topic coherence - continuation should share some keywords with original
+            continuation_words = set(continuation_lower.split()[:50])  # First 50 words
+            shared_medical_words = continuation_words.intersection(set(medical_keywords))
+            shared_message_words = continuation_words.intersection(message_words)
+            
+            # Red flags for hallucination/off-topic:
+            hallucination_indicators = [
+                # Wikipedia-style content
+                'wikipedia:', 'de.wikipedia.org', 'https://', 'http://', 'www.',
+                # Non-medical topics that shouldn't appear in medical responses
+                'kawaii', 'japanisch', 'deutsch', 'anime', 'manga', 'cosplay',
+                'barbie', 'hello-kitty', 'disney', 'fashion', 'pop culture',
+                # Meta content about editing articles
+                'edit this page', 'create one yourself', 'click below',
+                'see also:', 'references', 'external links', 'commons:',
+                'wikidata', 'wikitionary', 'beautywiki',
+                # URL patterns
+                'time.com', 'britannica.com', 'globalvoices.org', 'spiegel.de',
+                # Language switching (if original was English, continuation shouldn't be German/Japanese)
+                (message_lower and not any(lang in continuation_lower[:100] for lang in ['japanisch', 'deutsch', 'kawaii']) 
+                 and any(lang in continuation_lower[:100] for lang in ['japanisch', 'deutsch']) 
+                 and not any(med in continuation_lower[:100] for med in medical_keywords))
+            ]
+            
+            # If continuation has hallucination indicators and no medical context, it's off-topic
+            has_hallucination_indicators = any(indicator for indicator in hallucination_indicators if isinstance(indicator, str) and indicator in continuation_lower)
+            has_language_switch = any(isinstance(ind, bool) and ind for ind in hallucination_indicators)
+            
+            if (has_hallucination_indicators or has_language_switch) and not continuation_has_medical:
+                return True
+            
+            # If original had medical context but continuation doesn't, might be off-topic
+            if original_has_medical and not continuation_has_medical and len(continuation_text) > 100:
+                # Check if continuation is about completely different topics
+                non_medical_topics = ['fashion', 'anime', 'manga', 'culture', 'internet', 'viral', 'trend', 'kawaii']
+                if any(topic in continuation_lower for topic in non_medical_topics):
+                    return True
+            
+            # Check topic coherence - if continuation has no shared medical/message words, might be off-topic
+            if original_has_medical and len(continuation_text) > 100:
+                if len(shared_medical_words) == 0 and len(shared_message_words) == 0:
+                    # No shared keywords at all - likely off-topic
+                    return True
+            
+            # Check if continuation seems to be repeating or going in circles
+            if len(continuation_text) > 200:
+                # Check for excessive repetition of same phrases
+                words = continuation_lower.split()
+                if len(words) > 50:
+                    word_counts = {}
+                    for word in words:
+                        if len(word) > 4:  # Only check longer words
+                            word_counts[word] = word_counts.get(word, 0) + 1
+                    # If any word appears more than 10 times in 200 chars, might be stuck
+                    if any(count > 10 for count in word_counts.values()):
+                        return True
+            
+            return False
+        
+        # Function to check if continuation is completing the answer plan
+        def is_continuation_on_plan(original_text, continuation_text, original_message):
+            """Check if continuation is actually continuing the original answer plan."""
+            if not continuation_text or len(continuation_text.strip()) < 20:
+                return False
+            
+            # Extract structure from original response
+            original_structure = extract_answer_structure(original_text)
+            
+            # Check if continuation mentions topics from original structure
+            continuation_lower = continuation_text.lower()
+            
+            # If original had structure, continuation should relate to it
+            if original_structure:
+                structure_mentions = sum(1 for struct_elem in original_structure if struct_elem in continuation_lower)
+                if structure_mentions == 0 and len(continuation_text) > 100:
+                    # Continuation doesn't mention any original structure elements
+                    return False
+            
+            # Check if continuation is actually continuing (not starting a new topic)
+            # Look for continuation indicators
+            continuation_indicators = [
+                'continuing', 'further', 'additionally', 'moreover', 'also',
+                'next', 'another', 'in addition', 'furthermore', 'besides'
+            ]
+            
+            # Check if continuation starts with a new topic (bad) vs continuing (good)
+            first_50_chars = continuation_lower[:50]
+            starts_new_topic = any(first_50_chars.startswith(new_topic) for new_topic in 
+                                  ['kawaii', 'wikipedia', 'japanisch', 'deutsch', 'anime'])
+            
+            if starts_new_topic:
+                return False
+            
+            return True
         
         # Check if response is complete
         is_complete = is_response_complete(final_text)
@@ -1162,14 +1334,35 @@ def stream_chat(
         continuation_chunk_size = int(max_new_tokens * 0.5)  # Generate 50% more tokens each continuation
         total_tokens_generated = chunk_count  # Approximate from chunks
         continuation_count = 0
-        max_continuations = 5  # Maximum number of continuation attempts
+        max_continuations = 3  # Reduced from 5 to prevent excessive hallucination
+        original_response_before_continuation = final_text  # Store original response
         
         while not is_complete and continuation_count < max_continuations and total_tokens_generated < max_total_tokens:
             continuation_count += 1
             logger.info(f"Response incomplete - continuing generation (continuation {continuation_count}/{max_continuations})")
             
-            # Prepare continuation prompt (use the current response as context)
-            continuation_prompt = prompt + final_text
+            # Prepare continuation prompt more carefully to maintain context and answer plan
+            # Extract the answer structure/plan from original response
+            answer_structure = extract_answer_structure(original_response_before_continuation)
+            
+            # Use the last portion of the response to maintain context
+            # But also include key structure elements to maintain the plan
+            response_tail = final_text[-400:] if len(final_text) > 400 else final_text  # Last 400 chars
+            
+            # Build continuation prompt with explicit instructions to maintain plan
+            structure_hint = ""
+            if answer_structure:
+                structure_hint = f"\n[Answer structure/plan to continue: {', '.join(answer_structure[:3])}...]"
+            
+            continuation_prompt = (
+                f"{prompt}\n\n"
+                f"[Previous response (incomplete):]\n{response_tail}\n\n"
+                f"{structure_hint}\n\n"
+                f"[Instructions: Continue the medical response from where it left off. "
+                f"Stay on the same topic and complete the answer plan. "
+                f"Do NOT start new topics or include Wikipedia-style content, URLs, or non-medical topics. "
+                f"Continue naturally from the last sentence.]"
+            )
             
             # Tokenize continuation prompt
             continuation_enc = global_tokenizer(
@@ -1234,14 +1427,32 @@ def stream_chat(
             )
             continuation_thread.start()
             
-            # Collect continuation tokens
+            # Collect continuation tokens with real-time hallucination detection
             continuation_text = ""
             continuation_chunk_count = 0
+            off_topic_detected = False
             
             for continuation_chunk in continuation_streamer:
                 if continuation_chunk:
                     continuation_text += continuation_chunk
                     continuation_chunk_count += 1
+                    
+                    # Check for hallucination and plan coherence after collecting some text
+                    if len(continuation_text) > 50 and continuation_chunk_count % 10 == 0:
+                        # Check for off-topic/hallucination
+                        if is_continuation_off_topic(original_response_before_continuation, continuation_text, message):
+                            logger.warning(f"Hallucination/off-topic detected in continuation {continuation_count} after {len(continuation_text)} chars")
+                            logger.warning(f"Off-topic text sample: '{continuation_text[:200]}...'")
+                            off_topic_detected = True
+                            # Stop the continuation thread
+                            stop_event.set()
+                            break
+                        
+                        # Check if continuation is following the plan
+                        if not is_continuation_on_plan(original_response_before_continuation, continuation_text, message):
+                            logger.warning(f"Continuation {continuation_count} may not be following the answer plan after {len(continuation_text)} chars")
+                            # Don't stop immediately, but log warning
+                    
                     # Update UI with continuation
                     final_text = (partial_response + continuation_text).strip()
                     updated_history[-1]["content"] = final_text
@@ -1250,11 +1461,45 @@ def stream_chat(
             # Wait for continuation thread to complete
             continuation_thread.join(timeout=10.0)
             
-            # Append continuation to response
+            # If off-topic was detected, discard the continuation and stop
+            if off_topic_detected:
+                logger.warning(f"Stopping continuation {continuation_count} due to hallucination/off-topic content")
+                # Revert to original response before continuation
+                final_text = original_response_before_continuation
+                partial_response = original_response_before_continuation
+                is_complete = True  # Mark as complete to stop further continuations
+                break
+            
+            # Append continuation to response only if it's on-topic
             partial_response += continuation_text
             final_text = partial_response.strip()
             chunk_count += continuation_chunk_count
             total_tokens_generated += continuation_chunk_count
+            
+            # Final checks for hallucination and plan coherence on the full continuation
+            if is_continuation_off_topic(original_response_before_continuation, continuation_text, message):
+                logger.warning(f"Hallucination detected in full continuation {continuation_count} - discarding")
+                # Revert to original response
+                final_text = original_response_before_continuation
+                partial_response = original_response_before_continuation
+                is_complete = True
+                break
+            
+            # Check if continuation is following the plan
+            if not is_continuation_on_plan(original_response_before_continuation, continuation_text, message):
+                logger.warning(f"Continuation {continuation_count} may not be following the answer plan - checking if acceptable")
+                # If it's not following the plan but also not off-topic, we might still accept it
+                # but log a warning
+                if len(continuation_text) > 200 and not continuation_text.lower().startswith(('kawaii', 'wikipedia', 'japanisch')):
+                    # If it's substantial and not obviously wrong, accept it but warn
+                    logger.warning(f"Accepting continuation {continuation_count} despite plan deviation")
+                else:
+                    # If it's clearly wrong, discard it
+                    logger.warning(f"Discarding continuation {continuation_count} - not following plan")
+                    final_text = original_response_before_continuation
+                    partial_response = original_response_before_continuation
+                    is_complete = True
+                    break
             
             # Check if continuation is complete
             is_complete = is_response_complete(final_text)
