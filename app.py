@@ -7,6 +7,9 @@ import threading
 import time
 import re, unicodedata
 import numpy as np
+import json
+import hashlib
+from pathlib import Path
 
 from transformers import (
     AutoModelForCausalLM,
@@ -46,6 +49,11 @@ hf_logging.set_verbosity_error()
 # Retry configuration for ZeroGPU timeout handling
 MAX_RETRIES = 3
 RETRY_DELAY = 2.0  # seconds between retries
+
+# Cache configuration for GPU abort recovery
+CACHE_DIR = Path("./cache")
+CACHE_DIR.mkdir(exist_ok=True)
+CACHE_EXPIRY = 3600  # Cache expires after 1 hour
 
 # Log if .env was loaded (after logger is initialized)
 try:
@@ -558,6 +566,94 @@ def get_llm(temperature=0.0, max_new_tokens=256, top_p=0.95, top_k=50, model_nam
     )
 
 
+def _get_cache_key(message: str, history: list, params: dict) -> str:
+    """Generate a unique cache key for a chat request."""
+    # Create a hash from message, history, and parameters
+    cache_data = {
+        'message': message,
+        'history': history,
+        'params': params
+    }
+    cache_str = json.dumps(cache_data, sort_keys=True)
+    cache_hash = hashlib.sha256(cache_str.encode()).hexdigest()
+    return cache_hash
+
+
+def _save_cache(cache_key: str, partial_response: str, continuation_count: int = 0, metadata: dict = None):
+    """Save partial response to cache for recovery."""
+    try:
+        cache_file = CACHE_DIR / f"{cache_key}.json"
+        cache_data = {
+            'partial_response': partial_response,
+            'continuation_count': continuation_count,
+            'timestamp': time.time(),
+            'metadata': metadata or {}
+        }
+        with open(cache_file, 'w', encoding='utf-8') as f:
+            json.dump(cache_data, f, ensure_ascii=False, indent=2)
+        logger.info(f"Cache saved: {cache_key[:16]}... ({len(partial_response)} chars)")
+    except Exception as e:
+        logger.warning(f"Failed to save cache: {e}")
+
+
+def _load_cache(cache_key: str) -> dict:
+    """Load cached partial response if available and not expired."""
+    try:
+        cache_file = CACHE_DIR / f"{cache_key}.json"
+        if not cache_file.exists():
+            return None
+        
+        with open(cache_file, 'r', encoding='utf-8') as f:
+            cache_data = json.load(f)
+        
+        # Check if cache is expired
+        age = time.time() - cache_data.get('timestamp', 0)
+        if age > CACHE_EXPIRY:
+            logger.info(f"Cache expired: {cache_key[:16]}... (age: {age:.0f}s)")
+            cache_file.unlink()  # Delete expired cache
+            return None
+        
+        logger.info(f"Cache loaded: {cache_key[:16]}... ({len(cache_data.get('partial_response', ''))} chars, age: {age:.0f}s)")
+        return cache_data
+    except Exception as e:
+        logger.warning(f"Failed to load cache: {e}")
+        return None
+
+
+def _delete_cache(cache_key: str):
+    """Delete cache file after successful completion."""
+    try:
+        cache_file = CACHE_DIR / f"{cache_key}.json"
+        if cache_file.exists():
+            cache_file.unlink()
+            logger.info(f"Cache deleted: {cache_key[:16]}...")
+    except Exception as e:
+        logger.warning(f"Failed to delete cache: {e}")
+
+
+def _cleanup_old_cache():
+    """Clean up expired cache files."""
+    try:
+        current_time = time.time()
+        cleaned = 0
+        for cache_file in CACHE_DIR.glob("*.json"):
+            try:
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    cache_data = json.load(f)
+                age = current_time - cache_data.get('timestamp', 0)
+                if age > CACHE_EXPIRY:
+                    cache_file.unlink()
+                    cleaned += 1
+            except Exception:
+                # If file is corrupted or can't be read, delete it
+                cache_file.unlink()
+                cleaned += 1
+        if cleaned > 0:
+            logger.info(f"Cleaned up {cleaned} expired cache files")
+    except Exception as e:
+        logger.warning(f"Failed to cleanup cache: {e}")
+
+
 def extract_text_from_document(file):
     file_name = file.name
     file_extension = os.path.splitext(file_name)[1].lower()
@@ -747,43 +843,106 @@ def stream_chat(
     merge_threshold: float,
     request: gr.Request
 ):
-    """Stream chat with retry logic for ZeroGPU timeouts."""
+    """Stream chat with retry logic and caching for GPU abort recovery."""
     # --- guards & basics ---
     if not request:
         yield history + [{"role": "assistant", "content": "Session initialization failed. Please refresh the page."}]
         return
     
+    # Clean up old cache files periodically
+    if hasattr(stream_chat, '_last_cleanup'):
+        if time.time() - stream_chat._last_cleanup > 300:  # Every 5 minutes
+            _cleanup_old_cache()
+            stream_chat._last_cleanup = time.time()
+    else:
+        stream_chat._last_cleanup = time.time()
+        _cleanup_old_cache()
+    
+    # Generate cache key for this request
+    params = {
+        'system_prompt': system_prompt,
+        'disable_retrieval': disable_retrieval,
+        'temperature': temperature,
+        'max_new_tokens': max_new_tokens,
+        'top_p': top_p,
+        'top_k': top_k,
+        'penalty': penalty,
+        'retriever_k': retriever_k,
+        'merge_threshold': merge_threshold
+    }
+    cache_key = _get_cache_key(message, history, params)
+    
+    # Try to load cached partial response
+    cached_data = _load_cache(cache_key)
+    resume_from_cache = cached_data is not None
+    
     # Retry logic for ZeroGPU timeout handling
     last_exception = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            # Yield all chunks from the generator
-            for result in _stream_chat_impl(
-                message, history, system_prompt, disable_retrieval,
-                temperature, max_new_tokens, top_p, top_k, penalty,
-                retriever_k, merge_threshold, request
-            ):
-                yield result
-            # If we successfully completed, return
+            # If we have cached data and this is a retry, resume from cache
+            if resume_from_cache and attempt > 1:
+                logger.info(f"Resuming from cache (attempt {attempt}/{MAX_RETRIES})")
+                cached_partial = cached_data.get('partial_response', '')
+                cached_continuation = cached_data.get('continuation_count', 0)
+                cached_metadata = cached_data.get('metadata', {})
+                
+                # Yield cached partial response first
+                updated_history = history + [{"role": "user", "content": message}]
+                if cached_partial:
+                    updated_history.append({"role": "assistant", "content": cached_partial})
+                    yield updated_history
+                
+                # Continue generation from cache
+                for result in _stream_chat_impl(
+                    message, history, system_prompt, disable_retrieval,
+                    temperature, max_new_tokens, top_p, top_k, penalty,
+                    retriever_k, merge_threshold, request,
+                    resume_from_cache=cached_partial,
+                    resume_continuation_count=cached_continuation,
+                    cache_key=cache_key
+                ):
+                    yield result
+            else:
+                # Normal generation or first attempt
+                for result in _stream_chat_impl(
+                    message, history, system_prompt, disable_retrieval,
+                    temperature, max_new_tokens, top_p, top_k, penalty,
+                    retriever_k, merge_threshold, request,
+                    cache_key=cache_key
+                ):
+                    yield result
+            
+            # If we successfully completed, delete cache and return
+            _delete_cache(cache_key)
             return
         except (GeneratorExit, KeyboardInterrupt):
             # Generator was closed by client or user interrupted, don't retry
+            # But keep cache for potential recovery
             raise
         except Exception as e:
             last_exception = e
             error_msg = str(e).lower()
-            # Check if it's a timeout/abort related error
+            # Check if it's a timeout/abort/GPU related error
             is_timeout = any(keyword in error_msg for keyword in [
                 'timeout', 'abort', 'exceeded', 'duration', 'max_duration',
                 'killed', 'terminated', 'interrupted', 'connection reset',
-                'generator', 'generator exit'
+                'generator', 'generator exit', 'gpu', 'cuda', 'device',
+                'out of memory', 'oom', 'cuda error', 'gpu error',
+                'aborted', 'aborting', 'failed', 'error'
             ])
             
             if is_timeout and attempt < MAX_RETRIES:
                 logger.warning(f"Chat generation attempt {attempt}/{MAX_RETRIES} timed out/aborted. Retrying in {RETRY_DELAY}s...")
                 logger.warning(f"Error: {e}")
+                # Try to load cache for next retry
+                cached_data = _load_cache(cache_key)
+                resume_from_cache = cached_data is not None
+                if resume_from_cache:
+                    logger.info(f"Cache available for retry: {len(cached_data.get('partial_response', ''))} chars")
+                
                 # Yield error message to user
-                retry_msg = f"*[Generation timed out. Retrying ({attempt}/{MAX_RETRIES})...]*"
+                retry_msg = f"*[Generation interrupted. {'Resuming from cache...' if resume_from_cache else 'Retrying'} ({attempt}/{MAX_RETRIES})...]*"
                 yield history + [{"role": "user", "content": message}, {"role": "assistant", "content": retry_msg}]
                 time.sleep(RETRY_DELAY)
                 continue
@@ -791,7 +950,14 @@ def stream_chat(
                 # Not a timeout or max retries reached
                 logger.error(f"Chat generation failed after {attempt} attempt(s): {e}")
                 if attempt >= MAX_RETRIES:
-                    error_content = f"Error: Generation failed after {MAX_RETRIES} attempts. Last error: {str(e)[:200]}"
+                    # Try to return cached partial response if available
+                    cached_data = _load_cache(cache_key)
+                    if cached_data and cached_data.get('partial_response'):
+                        logger.info(f"Returning cached partial response after {MAX_RETRIES} failed attempts")
+                        cached_partial = cached_data.get('partial_response', '')
+                        error_content = f"{cached_partial}\n\n*[Generation failed after {MAX_RETRIES} attempts. Partial response above.]*"
+                    else:
+                        error_content = f"Error: Generation failed after {MAX_RETRIES} attempts. Last error: {str(e)[:200]}"
                     yield history + [{"role": "user", "content": message}, {"role": "assistant", "content": error_content}]
                     return
                 raise
@@ -816,9 +982,12 @@ def _stream_chat_impl(
     penalty: float,
     retriever_k: int,
     merge_threshold: float,
-    request: gr.Request
+    request: gr.Request,
+    cache_key: str = None,
+    resume_from_cache: str = None,
+    resume_continuation_count: int = 0
 ):
-    """Internal implementation of stream_chat without retry logic."""
+    """Internal implementation of stream_chat with caching support."""
     # --- guards & basics ---
     if not request:
         yield history + [{"role": "assistant", "content": "Session initialization failed. Please refresh the page."}]
@@ -1177,28 +1346,43 @@ def _stream_chat_impl(
     except Exception as e:
         logger.warning(f"Could not preview tokens: {e}")
     
-    # Start generation in a separate thread
-    generation_start_time = time.time()
-    thread = threading.Thread(target=global_model.generate, kwargs=generation_kwargs)
-    thread.start()
-    logger.info(f"Generation thread started at {generation_start_time}")
+    # Handle resume from cache if available
+    if resume_from_cache:
+        logger.info(f"Resuming from cache: {len(resume_from_cache)} chars, continuation: {resume_continuation_count}")
+        partial_response = resume_from_cache
+        final_text = partial_response
+        chunk_count = 0  # No chunks generated yet
+        # Update history with cached response
+        updated_history = history + [{"role": "user", "content": message}]
+        if partial_response:
+            updated_history.append({"role": "assistant", "content": partial_response})
+            yield updated_history
+        # Skip initial generation and go straight to continuation logic
+        skip_initial_generation = True
+    else:
+        # Start generation in a separate thread
+        generation_start_time = time.time()
+        thread = threading.Thread(target=global_model.generate, kwargs=generation_kwargs)
+        thread.start()
+        logger.info(f"Generation thread started at {generation_start_time}")
 
-    # prime UI
-    updated_history = (history or []) + [{"role": "user", "content": message}, {"role": "assistant", "content": ""}]
-    yield updated_history
+        # prime UI
+        updated_history = (history or []) + [{"role": "user", "content": message}, {"role": "assistant", "content": ""}]
+        yield updated_history
 
-    partial_response = ""
-    first_token_received = threading.Event()
+        partial_response = ""
+        skip_initial_generation = False
+        
+        first_token_received = threading.Event()
 
-    def _watch_first_token():
-        if not first_token_received.wait(timeout=45):
-            logger.warning("Generation timeout: no tokens in 45s; stopping stream.")
-            stop_event.set()
+        def _watch_first_token():
+            if not first_token_received.wait(timeout=45):
+                logger.warning("Generation timeout: no tokens in 45s; stopping stream.")
+                stop_event.set()
 
-    watchdog = threading.Thread(target=_watch_first_token, daemon=True)
-    watchdog.start()
+        watchdog = threading.Thread(target=_watch_first_token, daemon=True)
+        watchdog.start()
 
-    try:
         # Wait for generation to complete properly
         # The streamer might stop yielding before generation completes, so we need to ensure
         # we wait for the generation thread to finish
@@ -1214,44 +1398,59 @@ def _stream_chat_impl(
                 chunk_count += 1
                 last_chunk_time = time.time()
                 updated_history[-1]["content"] = partial_response
+                
+                # Save cache periodically (every 50 chunks to avoid overhead)
+                if cache_key and chunk_count % 50 == 0:
+                    _save_cache(cache_key, partial_response, 0, {'chunk_count': chunk_count})
+                
                 yield updated_history
         
-        streamer_end_time = time.time()
-        streamer_duration = streamer_end_time - generation_start_time
-        logger.info(f"Streamer exhausted after {chunk_count} chunks in {streamer_duration:.2f}s. Waiting for generation thread...")
-        
-        # Wait for the generation thread to complete to ensure all tokens are processed
-        # Use a longer timeout to ensure we capture all tokens
-        # The streamer might stop yielding but generation could still be ongoing
-        thread_join_timeout = 15.0  # Increased timeout for longer responses
-        thread.join(timeout=thread_join_timeout)
-        
-        generation_end_time = time.time()
-        generation_duration = generation_end_time - generation_start_time
-        
-        # Check if thread is still alive (didn't complete)
-        if thread.is_alive():
-            logger.warning(f"Generation thread still alive after {thread_join_timeout}s timeout (total: {generation_duration:.2f}s). Response may be incomplete.")
-            # Force stop if it's taking too long
-            stop_event.set()
-            thread.join(timeout=2.0)
+        if not skip_initial_generation:
+            streamer_end_time = time.time()
+            streamer_duration = streamer_end_time - generation_start_time
+            logger.info(f"Streamer exhausted after {chunk_count} chunks in {streamer_duration:.2f}s. Waiting for generation thread...")
+            
+            # Wait for the generation thread to complete to ensure all tokens are processed
+            # Use a longer timeout to ensure we capture all tokens
+            # The streamer might stop yielding but generation could still be ongoing
+            thread_join_timeout = 15.0  # Increased timeout for longer responses
+            thread.join(timeout=thread_join_timeout)
+            
+            generation_end_time = time.time()
+            generation_duration = generation_end_time - generation_start_time
+            
+            # Check if thread is still alive (didn't complete)
+            if thread.is_alive():
+                logger.warning(f"Generation thread still alive after {thread_join_timeout}s timeout (total: {generation_duration:.2f}s). Response may be incomplete.")
+                # Force stop if it's taking too long
+                stop_event.set()
+                thread.join(timeout=2.0)
+            else:
+                logger.info(f"Generation thread completed successfully in {generation_duration:.2f}s")
+            
+            # Additional check: sometimes the streamer stops early but generation completes
+            # Wait a bit more to ensure any final tokens are processed
+            # Note: We can't iterate over the streamer again, but we can check if generation is truly done
+            if not thread.is_alive():
+                # Give a small delay to ensure any final buffered tokens are processed
+                time.sleep(0.3)
+                # The streamer should have yielded all tokens by now if generation is complete
+            
+            # Minimal postprocessing: trim + clean filler/disclaimers
+            # Only clean if we have substantial content
+            final_text = (partial_response or "").strip()
+            
+            # Save cache after initial generation
+            if cache_key and final_text:
+                _save_cache(cache_key, final_text, 0, {'chunk_count': chunk_count, 'stage': 'initial'})
+            
+            # Log response length for debugging
+            logger.info(f"Final response length: {len(final_text)} characters, {chunk_count} chunks")
         else:
-            logger.info(f"Generation thread completed successfully in {generation_duration:.2f}s")
-        
-        # Additional check: sometimes the streamer stops early but generation completes
-        # Wait a bit more to ensure any final tokens are processed
-        # Note: We can't iterate over the streamer again, but we can check if generation is truly done
-        if not thread.is_alive():
-            # Give a small delay to ensure any final buffered tokens are processed
-            time.sleep(0.3)
-            # The streamer should have yielded all tokens by now if generation is complete
-        
-        # Minimal postprocessing: trim + clean filler/disclaimers
-        # Only clean if we have substantial content
-        final_text = (partial_response or "").strip()
-        
-        # Log response length for debugging
-        logger.info(f"Final response length: {len(final_text)} characters, {chunk_count} chunks")
+            # When resuming from cache, initialize continuation_count from cache
+            continuation_count = resume_continuation_count
+            # Mark response as incomplete to continue from where we left off
+            is_complete = False
         
         # Function to check if response is complete
         def is_response_complete(text):
@@ -2177,6 +2376,14 @@ def _stream_chat_impl(
                 partial_response += continuation_clean
                 final_text = partial_response.strip()
                 
+                # Save cache after each continuation
+                if cache_key and final_text:
+                    _save_cache(cache_key, final_text, continuation_count, {
+                        'chunk_count': chunk_count,
+                        'continuation_chunk_count': continuation_chunk_count,
+                        'stage': 'continuation'
+                    })
+                
                 # Track continuation content methodically
                 continuation_summary = {
                     'count': continuation_count,
@@ -2293,16 +2500,31 @@ def _stream_chat_impl(
             for token_str in special_token_strings:
                 final_text = final_text.replace(token_str, "")
             final_text = _clean_leading_filler(_strip_disclaimers(final_text))
+        
+        # Save final cache before yielding
+        if cache_key and final_text:
+            _save_cache(cache_key, final_text, continuation_count, {
+                'chunk_count': chunk_count,
+                'stage': 'final',
+                'is_complete': is_complete
+            })
+        
         updated_history[-1]["content"] = final_text
         yield updated_history
 
     except GeneratorExit:
         stop_event.set()
         thread.join()
+        # Save cache on exit for recovery
+        if cache_key and partial_response:
+            _save_cache(cache_key, partial_response, continuation_count, {'stage': 'interrupted'})
         raise
     except Exception as e:
         logger.exception(f"streaming error: {e}")
         stop_event.set()
+        # Save cache on error for recovery
+        if cache_key and partial_response:
+            _save_cache(cache_key, partial_response, continuation_count, {'stage': 'error', 'error': str(e)[:200]})
         updated_history[-1]["content"] = (partial_response or "") + "\n\n[Generation stopped due to an internal error.]"
         yield updated_history
 
