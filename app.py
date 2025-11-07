@@ -889,9 +889,12 @@ def stream_chat(
                 
                 # Yield cached partial response first
                 updated_history = history + [{"role": "user", "content": message}]
+                model_status = "Model is generating initial answer..."
                 if cached_partial:
                     updated_history.append({"role": "assistant", "content": cached_partial})
-                    yield updated_history
+                    yield updated_history, model_status
+                else:
+                    yield updated_history, model_status
                 
                 # Continue generation from cache
                 for result in _stream_chat_impl(
@@ -943,7 +946,8 @@ def stream_chat(
                 
                 # Yield error message to user
                 retry_msg = f"*[Generation interrupted. {'Resuming from cache...' if resume_from_cache else 'Retrying'} ({attempt}/{MAX_RETRIES})...]*"
-                yield history + [{"role": "user", "content": message}, {"role": "assistant", "content": retry_msg}]
+                model_status = f"Retrying generation ({attempt}/{MAX_RETRIES})..."
+                yield history + [{"role": "user", "content": message}, {"role": "assistant", "content": retry_msg}], model_status
                 time.sleep(RETRY_DELAY)
                 continue
             else:
@@ -958,16 +962,18 @@ def stream_chat(
                         error_content = f"{cached_partial}\n\n*[Generation failed after {MAX_RETRIES} attempts. Partial response above.]*"
                     else:
                         error_content = f"Error: Generation failed after {MAX_RETRIES} attempts. Last error: {str(e)[:200]}"
-                    yield history + [{"role": "user", "content": message}, {"role": "assistant", "content": error_content}]
+                    model_status = "Generation failed"
+                    yield history + [{"role": "user", "content": message}, {"role": "assistant", "content": error_content}], model_status
                     return
                 raise
     
     # Should not reach here, but handle it
+    model_status = "Error occurred"
     if last_exception:
         error_content = f"Error: {str(last_exception)[:200]}"
-        yield history + [{"role": "user", "content": message}, {"role": "assistant", "content": error_content}]
+        yield history + [{"role": "user", "content": message}, {"role": "assistant", "content": error_content}], model_status
     else:
-        yield history + [{"role": "user", "content": message}, {"role": "assistant", "content": "Unknown error occurred."}]
+        yield history + [{"role": "user", "content": message}, {"role": "assistant", "content": "Unknown error occurred."}], model_status
 
 
 def _stream_chat_impl(
@@ -990,7 +996,8 @@ def _stream_chat_impl(
     """Internal implementation of stream_chat with caching support."""
     # --- guards & basics ---
     if not request:
-        yield history + [{"role": "assistant", "content": "Session initialization failed. Please refresh the page."}]
+        model_status = "Session initialization failed"
+        yield history + [{"role": "assistant", "content": "Session initialization failed. Please refresh the page."}], model_status
         return
     user_id = request.session_hash
     index_dir = f"./{user_id}_index"
@@ -1018,8 +1025,9 @@ def _stream_chat_impl(
     try:
         if not disable_retrieval:
             if not os.path.exists(index_dir):
+                model_status = "No documents uploaded"
                 yield history + [{"role": "assistant", "content":
-                    "Please upload documents first or enable 'Disable document retrieval' to chat without documents."}]
+                    "Please upload documents first or enable 'Disable document retrieval' to chat without documents."}], model_status
                 return
 
             # Use global embedding model (loaded at startup)
@@ -1356,9 +1364,12 @@ def _stream_chat_impl(
             chunk_count = 0  # No chunks generated yet
             # Update history with cached response
             updated_history = history + [{"role": "user", "content": message}]
+            model_status = "Model is generating initial answer..."
             if partial_response:
                 updated_history.append({"role": "assistant", "content": partial_response})
-                yield updated_history
+                yield updated_history, model_status
+            else:
+                yield updated_history, model_status
             # Skip initial generation and go straight to continuation logic
             skip_initial_generation = True
         else:
@@ -1370,7 +1381,8 @@ def _stream_chat_impl(
 
             # prime UI
             updated_history = (history or []) + [{"role": "user", "content": message}, {"role": "assistant", "content": ""}]
-            yield updated_history
+            model_status = "Model is generating initial answer..."
+            yield updated_history, model_status
 
             partial_response = ""
             skip_initial_generation = False
@@ -1400,12 +1412,13 @@ def _stream_chat_impl(
                     chunk_count += 1
                     last_chunk_time = time.time()
                     updated_history[-1]["content"] = partial_response
+                    model_status = "Model is generating initial answer..."
                     
                     # Save cache periodically (every 50 chunks to avoid overhead)
                     if cache_key and chunk_count % 50 == 0:
                         _save_cache(cache_key, partial_response, 0, {'chunk_count': chunk_count})
                     
-                    yield updated_history
+                    yield updated_history, model_status
             
             if not skip_initial_generation:
                 streamer_end_time = time.time()
@@ -2080,7 +2093,8 @@ def _stream_chat_impl(
             # Add loader indicator to show sequential generation is happening
             loader_indicator = "\n\n*[Generating continuation answer...]*"
             updated_history[-1]["content"] = final_text + loader_indicator
-            yield updated_history
+            model_status = "Model is generating followup answer..."
+            yield updated_history, model_status
             
             # Prepare continuation prompt more carefully to maintain context and answer plan
             # Extract the answer structure/plan from original response
@@ -2133,7 +2147,7 @@ def _stream_chat_impl(
                             # Just continue the sequence
                             structure_hint = f"\n[Answer structure/plan: {', '.join(structure_items[-2:])}...]"
             
-            # Build continuation prompt - methodical and direct to maintain content flow
+            # Build continuation prompt - enhanced with better context and structure
             # Track what has been covered to guide continuation
             covered_topics = []
             if structure_items:
@@ -2142,20 +2156,59 @@ def _stream_chat_impl(
                     if item.lower() in final_text.lower():
                         covered_topics.append(item)
             
-            # Build methodical continuation instruction - direct and explicit
-            continuation_instruction = "Continue the medical answer directly from the last sentence. "
-            if covered_topics:
-                continuation_instruction += f"Topics already covered: {', '.join(covered_topics[:3])}. "
-            if structure_hint:
-                continuation_instruction += f"{structure_hint.strip()} "
-            continuation_instruction += "Provide the actual medical information. Do NOT include meta-commentary, instructions, clarifications, or questions. Do NOT acknowledge incomplete input or ask what the user wants. Simply continue the medical answer with facts and information."
+            # Extract key medical terms and concepts from the original message and response
+            # This helps maintain medical context in continuation
+            medical_context_keywords = []
+            message_lower = message.lower()
+            response_lower = final_text.lower()
             
-            # Build continuation prompt - simple and direct to avoid meta-commentary
-            # Use a cleaner format that doesn't encourage instructions or clarifications
+            # Extract medical terms from message
+            medical_terms = ['treatment', 'diagnosis', 'symptom', 'medication', 'therapy', 'disease', 
+                           'condition', 'disorder', 'chronic', 'acute', 'preventive', 'prophylactic']
+            for term in medical_terms:
+                if term in message_lower:
+                    medical_context_keywords.append(term)
+            
+            # Build enhanced continuation instruction with structured context
+            continuation_instruction_parts = []
+            
+            # 1. Core instruction
+            continuation_instruction_parts.append("Continue the medical answer directly from the last sentence without interruption.")
+            
+            # 2. Context summary (what's been covered)
+            if covered_topics:
+                continuation_instruction_parts.append(f"Topics already covered: {', '.join(covered_topics[:3])}.")
+            
+            # 3. Medical context (maintain medical focus)
+            if medical_context_keywords:
+                continuation_instruction_parts.append(f"Maintain focus on: {', '.join(medical_context_keywords[:3])}.")
+            
+            # 4. Structure guidance
+            if structure_hint:
+                continuation_instruction_parts.append(structure_hint.strip())
+            
+            # 5. Quality instructions
+            continuation_instruction_parts.append("Provide factual medical information. Maintain clinical tone and precision.")
+            continuation_instruction_parts.append("Do NOT include meta-commentary, instructions, clarifications, or questions.")
+            continuation_instruction_parts.append("Do NOT acknowledge incomplete input or ask what the user wants.")
+            continuation_instruction_parts.append("Simply continue the medical answer with facts and information.")
+            
+            # Combine all instruction parts
+            continuation_instruction = "\n".join(continuation_instruction_parts)
+            
+            # Build enhanced continuation prompt with structured context
+            # Include more context from the original response to maintain coherence
+            response_context = final_text[-600:] if len(final_text) > 600 else final_text  # Last 600 chars for better context
+            
+            # Build structured continuation prompt
             continuation_prompt = (
                 f"{prompt}\n\n"
-                f"Previous response (continue from here):\n{response_tail}\n\n"
-                f"{continuation_instruction}"
+                f"=== Previous Response (Incomplete) ===\n"
+                f"{response_context}\n\n"
+                f"=== Continuation Instructions ===\n"
+                f"{continuation_instruction}\n\n"
+                f"=== Continue From Here ===\n"
+                f"Continue naturally from the last sentence above."
             )
             
             logger.info(f"Continuation prompt length: {len(continuation_prompt)} chars, structure hint: {bool(structure_hint)}")
@@ -2284,7 +2337,8 @@ def _stream_chat_impl(
                     else:
                         final_text = (partial_response + continuation_text).strip()
                     updated_history[-1]["content"] = final_text
-                    yield updated_history
+                    model_status = "Model is generating followup answer..."
+                    yield updated_history, model_status
             
             # Wait for continuation thread to complete
             continuation_thread.join(timeout=10.0)
@@ -2678,7 +2732,8 @@ def _stream_chat_impl(
             })
         
         updated_history[-1]["content"] = final_text
-        yield updated_history
+        model_status = "Model complete answer generation"
+        yield updated_history, model_status
 
     except GeneratorExit:
         stop_event.set()
@@ -2694,7 +2749,8 @@ def _stream_chat_impl(
         if cache_key and partial_response:
             _save_cache(cache_key, partial_response, continuation_count, {'stage': 'error', 'error': str(e)[:200]})
         updated_history[-1]["content"] = (partial_response or "") + "\n\n[Generation stopped due to an internal error.]"
-        yield updated_history
+        model_status = "Model generation stopped due to error"
+        yield updated_history, model_status
 
 
     # remove duplicated second streaming loop
@@ -2857,7 +2913,7 @@ def create_demo():
                     inputs=[message_input, chatbot, system_prompt, disable_retrieval,
                             temperature, max_new_tokens, top_p, top_k, penalty,
                             retriever_k, merge_threshold],
-                    outputs=chatbot
+                    outputs=[chatbot, model_status]
                 )
 
                 message_input.submit(
@@ -2865,7 +2921,7 @@ def create_demo():
                     inputs=[message_input, chatbot, system_prompt, disable_retrieval,
                             temperature, max_new_tokens, top_p, top_k, penalty,
                             retriever_k, merge_threshold],
-                    outputs=chatbot
+                    outputs=[chatbot, model_status]
                 )
 
                 model_selector.change(
