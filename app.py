@@ -2043,7 +2043,10 @@ def _stream_chat_impl(
         max_total_tokens = int(max_new_tokens * 5)  # Allow up to 5x max_new_tokens total (increased)
         continuation_chunk_size = int(max_new_tokens * 0.5)  # Generate 50% more tokens each continuation
         total_tokens_generated = chunk_count  # Approximate from chunks
-        continuation_count = 0
+        # Initialize continuation_count - use cached value if resuming, otherwise start at 0
+        if not skip_initial_generation:
+            continuation_count = 0
+        # continuation_count already set from cache if resuming
         max_continuations = 10  # Increased to allow more continuations if on-topic
         original_response_before_continuation = final_text  # Store original response
         previous_continuation_texts = []  # Track previous continuations to detect repetition
