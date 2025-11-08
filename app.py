@@ -335,7 +335,7 @@ def _build_fallback_chat_prompt(messages, include_history: bool = True, max_hist
             # Only include if the last question is different from current question
             if recent_pairs and recent_pairs[-1][0] != last_user:
                 history_text = "\n".join([f"Q: {q}\nA: {a}" for q, a in recent_pairs])
-                instruction += f"\n\nContext Conversation (for background):\n{history_text}"
+            instruction += f"\n\nContext Conversation (for background):\n{history_text}"
     
     if last_user:
         instruction += f"\n\nTask: Answer the user's question.\nQuestion: {last_user}"
@@ -1607,12 +1607,12 @@ def _stream_chat_impl(
             partial_response = ""
             skip_initial_generation = False
             
-        first_token_received = threading.Event()
+            first_token_received = threading.Event()
 
-    def _watch_first_token():
-        if not first_token_received.wait(timeout=45):
-            logger.warning("Generation timeout: no tokens in 45s; stopping stream.")
-            stop_event.set()
+            def _watch_first_token():
+                if not first_token_received.wait(timeout=45):
+                    logger.warning("Generation timeout: no tokens in 45s; stopping stream.")
+                    stop_event.set()
 
             watchdog = threading.Thread(target=_watch_first_token, daemon=True)
             watchdog.start()
@@ -1624,9 +1624,9 @@ def _stream_chat_impl(
             chunk_count = 0
             no_chunk_timeout = 2.0  # If no chunks for 2 seconds, check if generation is done
             
-        for chunk in streamer:
-            if chunk and not first_token_received.is_set():
-                first_token_received.set()
+            for chunk in streamer:
+                if chunk and not first_token_received.is_set():
+                    first_token_received.set()
                 if chunk:
                     partial_response += chunk
                     chunk_count += 1
