@@ -316,18 +316,18 @@ def _build_fallback_chat_prompt(messages, include_history: bool = True, max_hist
     
     # Only include history if explicitly requested and if it's relevant
     if include_history:
-        history_pairs = []
-        current_q = None
-        for m in messages:
-            role = m.get("role")
-            content = (m.get("content", "") or "").strip()
-            if role == "user":
-                current_q = content
-            elif role == "assistant" and current_q:
+    history_pairs = []
+    current_q = None
+    for m in messages:
+        role = m.get("role")
+        content = (m.get("content", "") or "").strip()
+        if role == "user":
+            current_q = content
+        elif role == "assistant" and current_q:
                 # Only include complete QA pairs with substantial content
                 if len(current_q.strip()) > 10 and len(content.strip()) > 10:
-                    history_pairs.append((current_q, content))
-                current_q = None
+            history_pairs.append((current_q, content))
+            current_q = None
 
         # Only include recent, relevant history (default: last 1 pair, max 2)
         if history_pairs:
@@ -335,7 +335,7 @@ def _build_fallback_chat_prompt(messages, include_history: bool = True, max_hist
             # Only include if the last question is different from current question
             if recent_pairs and recent_pairs[-1][0] != last_user:
                 history_text = "\n".join([f"Q: {q}\nA: {a}" for q, a in recent_pairs])
-                instruction += f"\n\nContext Conversation (for background):\n{history_text}"
+        instruction += f"\n\nContext Conversation (for background):\n{history_text}"
     
     if last_user:
         instruction += f"\n\nTask: Answer the user's question.\nQuestion: {last_user}"
@@ -415,7 +415,7 @@ def _load_model_and_tokenizer(model_name: str):
     for attempt in range(max_retries):
         try:
             logger.info(f"Loading tokenizer for {model_name} (attempt {attempt + 1}/{max_retries})")
-            tok = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN)
+        tok = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN)
             break
         except (OSError, PermissionError, Exception) as e:
             error_str = str(e).lower()
@@ -457,9 +457,9 @@ def _load_model_and_tokenizer(model_name: str):
                 continue
             else:
                 # Try slow tokenizer as last resort
-                logger.warning(f"Fast tokenizer load failed ({e}). Retrying with slow tokenizer...")
+        logger.warning(f"Fast tokenizer load failed ({e}). Retrying with slow tokenizer...")
                 try:
-                    tok = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN, use_fast=False)
+        tok = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN, use_fast=False)
                     break
                 except Exception as e2:
                     raise
@@ -484,14 +484,14 @@ def _load_model_and_tokenizer(model_name: str):
     for attempt in range(max_retries):
         try:
             logger.info(f"Loading model for {model_name} (attempt {attempt + 1}/{max_retries})")
-            mdl = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                device_map="auto",
-                trust_remote_code=True,
-                token=HF_TOKEN,
-                dtype=dtype,
-                low_cpu_mem_usage=True,
-            )
+    mdl = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        device_map="auto",
+        trust_remote_code=True,
+        token=HF_TOKEN,
+        dtype=dtype,
+        low_cpu_mem_usage=True,
+    )
             break
         except (OSError, PermissionError, Exception) as e:
             error_str = str(e).lower()
@@ -1234,7 +1234,7 @@ def _stream_chat_impl(
     # --- language detection ---
     detected_lang = _detect_language(message)
     logger.info(f"[language] detected={detected_lang} for query: {message[:50]}...")
-    
+
     # --- retrieval (optional) ---
     context = ""
     source_info = ""
@@ -1309,7 +1309,7 @@ def _stream_chat_impl(
     
     # Handle system prompt based on language and whether RAG is enabled
     if detected_lang == 'vi':
-        if context:
+    if context:
             # For Vietnamese with context, be more explicit about using only relevant context
             sys_text = f"{sys_text}\n\n[Lưu ý: Chỉ sử dụng thông tin từ ngữ cảnh tài liệu nếu nó liên quan trực tiếp đến câu hỏi.]\n\n[Document Context]\n{context}{source_info}"
         else:
@@ -1322,7 +1322,7 @@ def _stream_chat_impl(
         # For English/other languages
         if context:
             # Add context normally when RAG is enabled
-            sys_text = f"{sys_text}\n\n[Document Context]\n{context}{source_info}"
+        sys_text = f"{sys_text}\n\n[Document Context]\n{context}{source_info}"
         elif disable_retrieval:
             # When RAG is disabled, instruct model to use its own medical knowledge
             sys_text = f"{sys_text}\n\n[Note: Answer based on your medical knowledge.]"
@@ -1382,7 +1382,7 @@ def _stream_chat_impl(
             self.stop_event = stop_event
         def __call__(self, input_ids, scores, **kwargs):
             return self.stop_event.is_set()
-    
+
     class IgnoreEOSUntilMinTokens(StoppingCriteria):
         """Prevent stopping on EOS token until we reach a minimum number of tokens."""
         def __init__(self, eos_token_id, min_tokens_to_ignore_eos, prompt_length):
@@ -1428,14 +1428,15 @@ def _stream_chat_impl(
                 return scores
             
             # Even after reaching the threshold, be more aggressive:
-            # Only allow EOS if we're very close to max_new_tokens (within 5%)
-            # This ensures we use almost all available tokens
+            # Only allow EOS if we're very close to max_new_tokens (within 2%)
+            # This ensures we use almost all available tokens and prevents mid-answer stopping
             tokens_remaining = self.max_new_tokens - new_tokens_count
-            threshold_remaining = int(self.max_new_tokens * 0.05)  # 5% of max tokens
+            threshold_remaining = int(self.max_new_tokens * 0.02)  # 2% of max tokens (more aggressive)
             
             if tokens_remaining > threshold_remaining:
-                # Still too many tokens remaining - prevent EOS
+                # Still too many tokens remaining - prevent EOS to avoid mid-answer stopping
                 scores[:, self.eos_token_id] = float('-inf')
+                logger.debug(f"Preventing EOS: {new_tokens_count}/{self.max_new_tokens} tokens generated, {tokens_remaining} remaining (threshold: {threshold_remaining})")
             
             return scores
 
@@ -1488,10 +1489,11 @@ def _stream_chat_impl(
     # Calculate prompt length for the stopping criteria
     prompt_length = enc['input_ids'].shape[-1] if isinstance(enc, dict) else enc.input_ids.shape[-1]
     
-    # Set minimum tokens before allowing EOS to stop (use 95% of max_new_tokens or min_tokens, whichever is higher)
+    # Set minimum tokens before allowing EOS to stop (use 98% of max_new_tokens or min_tokens, whichever is higher)
     # This ensures the model generates almost all tokens before EOS can stop, preventing incomplete responses
-    # Using 95% instead of 100% allows for natural stopping at the very end if the model truly finishes
-    min_tokens_before_eos = max(min_tokens, int(max_new_tokens * 0.95))
+    # Using 98% instead of 100% allows for natural stopping at the very end if the model truly finishes
+    # More aggressive to prevent mid-answer stopping
+    min_tokens_before_eos = max(min_tokens, int(max_new_tokens * 0.98))
     
     # Create stopping criteria list with both custom criteria
     stopping_criteria = StoppingCriteriaList([
@@ -1531,8 +1533,8 @@ def _stream_chat_impl(
         # Don't override eos_token_id in generation_config - let it use the default
     
     logger.info(f"Generation config: max_new_tokens={max_new_tokens}, min_new_tokens={effective_min_tokens}, eos_token_id={generation_eos_token_id}")
-    logger.info(f"EOS token enabled - model will generate at least {effective_min_tokens} tokens (95% of max) before EOS can stop")
-    logger.info(f"Logits processor will prevent EOS until {min_tokens_before_eos} tokens, then allow only when <5% tokens remain")
+    logger.info(f"EOS token enabled - model will generate at least {effective_min_tokens} tokens (98% of max) before EOS can stop")
+    logger.info(f"Logits processor will prevent EOS until {min_tokens_before_eos} tokens, then allow only when <2% tokens remain")
     
     generation_kwargs = dict(
         **enc,
@@ -1572,7 +1574,7 @@ def _stream_chat_impl(
     except Exception as e:
         logger.warning(f"Could not preview tokens: {e}")
     
-    # Wrap generation logic in try-except for error handling
+    # Wrap generation logic in try-except for error handling with GPU abort recovery
     try:
         # Handle resume from cache if available
         if resume_from_cache:
@@ -1593,27 +1595,27 @@ def _stream_chat_impl(
         else:
             # Start generation in a separate thread
             generation_start_time = time.time()
-            thread = threading.Thread(target=global_model.generate, kwargs=generation_kwargs)
-            thread.start()
+    thread = threading.Thread(target=global_model.generate, kwargs=generation_kwargs)
+    thread.start()
             logger.info(f"Generation thread started at {generation_start_time}")
 
-            # prime UI
-            updated_history = (history or []) + [{"role": "user", "content": message}, {"role": "assistant", "content": ""}]
+    # prime UI
+    updated_history = (history or []) + [{"role": "user", "content": message}, {"role": "assistant", "content": ""}]
             model_status = "Model is generating initial answer..."
             yield updated_history, model_status
 
-            partial_response = ""
+    partial_response = ""
             skip_initial_generation = False
             
-            first_token_received = threading.Event()
+    first_token_received = threading.Event()
 
-            def _watch_first_token():
-                if not first_token_received.wait(timeout=45):
-                    logger.warning("Generation timeout: no tokens in 45s; stopping stream.")
-                    stop_event.set()
+    def _watch_first_token():
+        if not first_token_received.wait(timeout=45):
+            logger.warning("Generation timeout: no tokens in 45s; stopping stream.")
+            stop_event.set()
 
-            watchdog = threading.Thread(target=_watch_first_token, daemon=True)
-            watchdog.start()
+    watchdog = threading.Thread(target=_watch_first_token, daemon=True)
+    watchdog.start()
 
             # Wait for generation to complete properly
             # The streamer might stop yielding before generation completes, so we need to ensure
@@ -1622,14 +1624,14 @@ def _stream_chat_impl(
             chunk_count = 0
             no_chunk_timeout = 2.0  # If no chunks for 2 seconds, check if generation is done
             
-            for chunk in streamer:
-                if chunk and not first_token_received.is_set():
-                    first_token_received.set()
+        for chunk in streamer:
+            if chunk and not first_token_received.is_set():
+                first_token_received.set()
                 if chunk:
-                    partial_response += chunk
+            partial_response += chunk
                     chunk_count += 1
                     last_chunk_time = time.time()
-                    updated_history[-1]["content"] = partial_response
+            updated_history[-1]["content"] = partial_response
                     model_status = "Model is generating initial answer..."
                     
                     # Save cache periodically (every 50 chunks to avoid overhead)
@@ -1668,7 +1670,7 @@ def _stream_chat_impl(
                     # Give a small delay to ensure any final buffered tokens are processed
                     time.sleep(0.3)
                     # The streamer should have yielded all tokens by now if generation is complete
-                
+
                 # Minimal postprocessing: trim + clean filler/disclaimers
                 # Only clean if we have substantial content
                 final_text = (partial_response or "").strip()
@@ -2405,11 +2407,14 @@ def _stream_chat_impl(
             if structure_hint:
                 continuation_instruction_parts.append(structure_hint.strip())
             
-            # 5. Quality instructions
+            # 5. Quality instructions - explicitly prevent commentary and meta-responses
             continuation_instruction_parts.append("Provide factual medical information. Maintain clinical tone and precision.")
             continuation_instruction_parts.append("Do NOT include meta-commentary, instructions, clarifications, or questions.")
             continuation_instruction_parts.append("Do NOT acknowledge incomplete input or ask what the user wants.")
-            continuation_instruction_parts.append("Simply continue the medical answer with facts and information.")
+            continuation_instruction_parts.append("Do NOT say things like 'sure', 'here is', 'to complete', 'followup answer', 'let me continue', etc.")
+            continuation_instruction_parts.append("Do NOT explain what you're doing or why you're continuing.")
+            continuation_instruction_parts.append("Simply continue the medical answer directly with facts and information.")
+            continuation_instruction_parts.append("Start immediately with the medical content, as if the previous sentence never ended.")
             
             # Combine all instruction parts
             continuation_instruction = "\n".join(continuation_instruction_parts)
@@ -2418,15 +2423,23 @@ def _stream_chat_impl(
             # Include more context from the original response to maintain coherence
             response_context = final_text[-600:] if len(final_text) > 600 else final_text  # Last 600 chars for better context
             
+            # Build structured continuation prompt - focused on completing the incomplete task
+            # Extract the core question/task from the original message to maintain focus
+            core_task = message.strip()
+            if len(core_task) > 200:
+                core_task = core_task[:200] + "..."
+            
             # Build structured continuation prompt
             continuation_prompt = (
                 f"{prompt}\n\n"
+                f"=== Original Question/Task ===\n"
+                f"{core_task}\n\n"
                 f"=== Previous Response (Incomplete) ===\n"
                 f"{response_context}\n\n"
                 f"=== Continuation Instructions ===\n"
                 f"{continuation_instruction}\n\n"
                 f"=== Continue From Here ===\n"
-                f"Continue naturally from the last sentence above."
+                f"Continue directly from the last sentence above to complete the answer to: {core_task[:100]}"
             )
             
             logger.info(f"Continuation prompt length: {len(continuation_prompt)} chars, structure hint: {bool(structure_hint)}")
@@ -2522,8 +2535,16 @@ def _stream_chat_impl(
                         
                         # Quick check for meta-commentary patterns before full off-topic check
                         check_text_lower = check_text.lower()
-                        meta_patterns = ['acknowledge', 'clarify', 'what specifically', 'address the core', 
-                                       'wants to know', 'what are you looking', '/meh/']
+                        meta_patterns = [
+                            'acknowledge', 'clarify', 'what specifically', 'address the core', 
+                            'wants to know', 'what are you looking', '/meh/',
+                            # Commentary patterns
+                            'sure,', 'here is', 'here\'s', 'to complete', 'followup answer',
+                            'let me continue', 'let me provide', 'i will continue', 'i\'ll continue',
+                            'to finish', 'to complete the', 'completing the', 'continuing the',
+                            'as requested', 'as you asked', 'as mentioned', 'as discussed',
+                            'i understand', 'i see', 'i note', 'i recognize', 'i acknowledge'
+                        ]
                         if any(pattern in check_text_lower for pattern in meta_patterns) and len(check_text) > 50:
                             logger.warning(f"Meta-commentary detected in real-time check: '{check_text[:200]}'")
                             off_topic_detected = True
@@ -2580,9 +2601,15 @@ def _stream_chat_impl(
                 '<end_of_turn>thought', '<end_of_turn>', 'end_of_turn', 'thought',
                 'the prompt asks you', 'the user has stopped', 'provide steps involved',
                 'so provide steps', 'steps involved in developing',
+                # Commentary and meta-response patterns
+                'sure,', 'here is', 'here\'s', 'to complete', 'followup answer',
+                'let me continue', 'let me provide', 'i will continue', 'i\'ll continue',
+                'to finish', 'to complete the', 'completing the', 'continuing the',
+                'as requested', 'as you asked', 'as mentioned', 'as discussed',
                 'acknowledge incomplete', 'clarify expectations', 'what specifically',
                 'address the core issue', 'wants to know more', 'what are you looking for',
-                'state clearly', 'ask again', 'emphasize the goal', 'mention "structural"'
+                'state clearly', 'ask again', 'emphasize the goal', 'mention "structural"',
+                'i understand', 'i see', 'i note', 'i recognize', 'i acknowledge'
             ]
             for token in internal_tokens:
                 continuation_clean = continuation_clean.replace(token, '')
@@ -2602,13 +2629,25 @@ def _stream_chat_impl(
                     'so provide steps', 'steps involved',
                     'acknowledge', 'clarify', 'state clearly', 'ask again',
                     'what specifically', 'address the core', 'wants to know',
-                    'what are you looking', 'emphasize the goal'
+                    'what are you looking', 'emphasize the goal',
+                    # Commentary patterns
+                    'sure,', 'here is', 'here\'s', 'to complete', 'followup',
+                    'let me continue', 'let me provide', 'i will continue', 'i\'ll continue',
+                    'to finish', 'to complete the', 'completing the', 'continuing the',
+                    'as requested', 'as you asked', 'as mentioned', 'as discussed',
+                    'i understand', 'i see', 'i note', 'i recognize', 'i acknowledge'
                 ]) or any(pattern in line_lower for pattern in [
                     '<end_of_turn>', 'end_of_turn', 'thought process',
                     'the prompt asks', 'the user has stopped responding',
                     'acknowledge incomplete', 'clarify expectations',
                     'what specifically are you', 'address the core issue',
-                    'wants to know more', 'what are you looking for now'
+                    'wants to know more', 'what are you looking for now',
+                    # Commentary patterns
+                    'sure, here', 'here is the', 'here\'s the', 'to complete the',
+                    'followup answer', 'let me continue', 'let me provide',
+                    'i will continue', 'i\'ll continue', 'to finish the',
+                    'completing the answer', 'continuing the answer',
+                    'as you requested', 'as you asked', 'as mentioned earlier'
                 ]):
                     continue
                 
@@ -2939,7 +2978,7 @@ def _stream_chat_impl(
             final_text = re.sub(r'\n\s*\n\s*\n', '\n\n', final_text)  # Max 2 consecutive newlines
             final_text = re.sub(r'[ \t]{2,}', ' ', final_text)  # Collapse multiple spaces
             
-            final_text = _clean_leading_filler(_strip_disclaimers(final_text))
+        final_text = _clean_leading_filler(_strip_disclaimers(final_text))
         
         # Save final cache before yielding
         if cache_key and final_text:
@@ -2960,15 +2999,46 @@ def _stream_chat_impl(
         if cache_key and partial_response:
             _save_cache(cache_key, partial_response, continuation_count, {'stage': 'interrupted'})
         raise
-    except Exception as e:
-        logger.exception(f"streaming error: {e}")
+    except (RuntimeError, torch.cuda.OutOfMemoryError, Exception) as e:
+        error_msg = str(e).lower()
+        is_gpu_abort = any(keyword in error_msg for keyword in [
+            'cuda', 'gpu', 'out of memory', 'oom', 'abort', 'timeout',
+            'device', 'cuda error', 'runtime error'
+        ])
+        
+        logger.exception(f"Streaming error: {e} (GPU abort: {is_gpu_abort})")
         stop_event.set()
-        # Save cache on error for recovery
+        
+        # Save cache on error for recovery (especially for GPU aborts)
         if cache_key and partial_response:
-            _save_cache(cache_key, partial_response, continuation_count, {'stage': 'error', 'error': str(e)[:200]})
-        updated_history[-1]["content"] = (partial_response or "") + "\n\n[Generation stopped due to an internal error.]"
-        model_status = "Model generation stopped due to error"
-        yield updated_history, model_status
+            _save_cache(cache_key, partial_response, continuation_count, {
+                'stage': 'error', 
+                'error': str(e)[:200],
+                'is_gpu_abort': is_gpu_abort,
+                'recoverable': True
+            })
+            logger.info(f"Cache saved for recovery: {cache_key[:16]}... ({len(partial_response)} chars)")
+        
+        # If GPU abort and we have cached data, try to recover
+        if is_gpu_abort and cache_key:
+            cached_data = _load_cache(cache_key)
+            if cached_data and cached_data.get('partial_response'):
+                logger.info(f"GPU abort detected - attempting recovery from cache")
+                updated_history[-1]["content"] = (
+                    cached_data['partial_response'] + 
+                    f"\n\n[Note: Generation was interrupted due to GPU error. "
+                    f"Partial response recovered from cache. You may continue the conversation.]"
+                )
+                yield updated_history, "GPU error - partial response recovered from cache"
+                return
+        
+        # If no cache recovery possible, show error
+        updated_history[-1]["content"] = (
+            (partial_response or "") + 
+            f"\n\n[Error: Generation stopped due to {('GPU error' if is_gpu_abort else 'internal error')}. "
+            f"Please try again or refresh the page.]"
+        )
+        yield updated_history, f"Error: {('GPU abort' if is_gpu_abort else 'Generation failed')}"
 
 
     # remove duplicated second streaming loop
@@ -3116,20 +3186,20 @@ def create_demo():
                         else:
                             # Reset gemini_client when switching to HuggingFace models
                             gemini_client = None
-                            if choice == "MedSwin-7B KD":
-                                name = MEDSWIN_KD_MODEL
-                            elif choice == "MedSwin-7B SFT":
-                                name = MEDSWIN_SFT_MODEL
-                            elif choice == "MedAlpaca-7B":
-                                name = MEDALPACA_MODEL
+                    if choice == "MedSwin-7B KD":
+                        name = MEDSWIN_KD_MODEL
+                    elif choice == "MedSwin-7B SFT":
+                        name = MEDSWIN_SFT_MODEL
+                    elif choice == "MedAlpaca-7B":
+                        name = MEDALPACA_MODEL
                             elif choice == "MedGemma-27B":
-                                name = MEDGEMMA_MODEL
+                        name = MEDGEMMA_MODEL
                             else:
                                 # Unknown choice, don't try to load anything
                                 return f"Unknown model: {choice}"
                             # Only load HuggingFace model if not using Gemini
-                            initialize_model_and_tokenizer(name)
-                            return f"Loaded: {choice}"
+                    initialize_model_and_tokenizer(name)
+                    return f"Loaded: {choice}"
                     except PermissionError as e:
                         error_msg = str(e)
                         logger.error(f"Model loading failed: {error_msg}")
