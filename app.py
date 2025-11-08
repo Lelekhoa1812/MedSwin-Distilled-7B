@@ -344,7 +344,7 @@ def _build_fallback_chat_prompt(messages, include_history: bool = True, max_hist
         "Task: Complete the request below.\n\n"
         "### Instruction:\n"
         f"{instruction}\n"
-        "Use plain text only - no tables or complex Markdown. Be concise and direct.\n\n"
+        "Plain text only - no tables/Markdown. Be concise.\n\n"
         "### Response:\n"
     )
 
@@ -352,7 +352,7 @@ def _build_fallback_chat_prompt(messages, include_history: bool = True, max_hist
 def build_prompt(messages, tokenizer, system_prompt: str, context: str, source_info: str):
     sys = system_prompt.strip()
     if context:
-        sys = f"{sys}\n\n[Document Context]\n{context}{source_info}"
+        sys = f"{sys}\n\n[Document Context]\n{context}{source_info}\n[Note: Plain text only - no tables/Markdown. Be concise.]"
 
     # Prefer chat template only for models known to support it reliably.
     # For MedSwin / MedAlpaca SFTs, stick to a clean instruct fallback to avoid off-topic outputs.
@@ -376,12 +376,8 @@ def build_prompt(messages, tokenizer, system_prompt: str, context: str, source_i
         "### System\n"
         f"{sys}\n\n"
         "### Rules\n"
-        "- Answer directly in clinical language.\n"
-        "- Do not mention that you are an AI.\n"
-        "- Do not include meta commentary.\n"
-        "- Keep it concise and evidence-focused.\n"
-        "- Use plain text only - no tables or complex Markdown.\n"
-        "- Be brief and focused.\n\n"
+        "- Clinical language only. No AI mentions or meta-commentary.\n"
+        "- Plain text only - no tables/Markdown. Be concise.\n\n"
         "### Conversation\n"
     )
     for m in messages:
@@ -968,14 +964,14 @@ def gemini_chat(
     # Handle system prompt based on language and whether RAG is enabled
     if detected_lang == 'vi':
         if context:
-            sys_text = f"{sys_text}\n\n[Lưu ý: Chỉ dùng thông tin từ ngữ cảnh nếu liên quan. Dùng văn bản thuần - không bảng hay Markdown phức tạp. Trả lời ngắn gọn.]\n\n[Document Context]\n{context}{source_info}"
+            sys_text = f"{sys_text}\n\n[Lưu ý: Dùng ngữ cảnh nếu liên quan. Văn bản thuần - không bảng/Markdown. Ngắn gọn.]\n\n[Document Context]\n{context}{source_info}"
         else:
-            sys_text = f"{sys_text}\n\n[Lưu ý: Trả lời bằng tiếng Việt, ngắn gọn, dùng văn bản thuần.]"
+            sys_text = f"{sys_text}\n\n[Lưu ý: Tiếng Việt, ngắn gọn, văn bản thuần - không bảng.]"
     else:
         if context:
-            sys_text = f"{sys_text}\n\n[Document Context]\n{context}{source_info}\n[Note: Use plain text only - no tables or complex Markdown. Be concise.]"
+            sys_text = f"{sys_text}\n\n[Document Context]\n{context}{source_info}\n[Note: Plain text only - no tables/Markdown. Be concise.]"
         elif disable_retrieval:
-            sys_text = f"{sys_text}\n\n[Note: Answer based on your medical knowledge. Use plain text only - no tables. Be concise.]"
+            sys_text = f"{sys_text}\n\n[Note: Use medical knowledge. Plain text only - no tables. Be concise.]"
     
     # Build conversation messages for Gemini
     convo_msgs = [{"role": "system", "content": sys_text}]
@@ -1314,21 +1310,18 @@ def _stream_chat_impl(
     if detected_lang == 'vi':
         if context:
             # For Vietnamese with context, be more explicit about using only relevant context
-            sys_text = f"{sys_text}\n\n[Lưu ý: Chỉ dùng thông tin từ ngữ cảnh nếu liên quan. Dùng văn bản thuần - không bảng hay Markdown phức tạp. Trả lời ngắn gọn.]\n\n[Document Context]\n{context}{source_info}"
+            sys_text = f"{sys_text}\n\n[Lưu ý: Dùng ngữ cảnh nếu liên quan. Văn bản thuần - không bảng/Markdown. Ngắn gọn.]\n\n[Document Context]\n{context}{source_info}"
         else:
             # For Vietnamese without context (RAG disabled), emphasize using medical knowledge
-            if disable_retrieval:
-                sys_text = f"{sys_text}\n\n[Lưu ý: Trả lời bằng tiếng Việt, ngắn gọn, dùng văn bản thuần.]"
-            else:
-                sys_text = f"{sys_text}\n\n[Lưu ý: Trả lời bằng tiếng Việt, ngắn gọn, dùng văn bản thuần.]"
+            sys_text = f"{sys_text}\n\n[Lưu ý: Tiếng Việt, ngắn gọn, văn bản thuần - không bảng.]"
     else:
         # For English/other languages
         if context:
             # Add context normally when RAG is enabled
-            sys_text = f"{sys_text}\n\n[Document Context]\n{context}{source_info}\n[Note: Use plain text only - no tables or complex Markdown. Be concise.]"
+            sys_text = f"{sys_text}\n\n[Document Context]\n{context}{source_info}\n[Note: Plain text only - no tables/Markdown. Be concise.]"
         elif disable_retrieval:
             # When RAG is disabled, instruct model to use its own medical knowledge
-            sys_text = f"{sys_text}\n\n[Note: Answer based on your medical knowledge. Use plain text only - no tables. Be concise.]"
+            sys_text = f"{sys_text}\n\n[Note: Use medical knowledge. Plain text only - no tables. Be concise.]"
 
     # Reconstruct conversation for template with smart history filtering
     # Only include recent, relevant history to avoid confusion and hallucinations
@@ -2407,7 +2400,7 @@ def _stream_chat_impl(
                 continuation_instruction_parts.append(f"Focus: {', '.join(medical_context_keywords[:2])}.")
             
             # Quality instructions (simplified and consolidated)
-            continuation_instruction_parts.append("Use plain text only - no tables or complex Markdown. Be concise. Continue directly with medical facts - no meta-commentary, questions, or explanations.")
+            continuation_instruction_parts.append("Plain text only - no tables/Markdown. Be concise. Continue with medical facts - no meta-commentary.")
             
             # Combine all instruction parts
             continuation_instruction = "\n".join(continuation_instruction_parts)
@@ -3097,9 +3090,9 @@ def create_demo():
                 with gr.Accordion("Advanced Settings", open=False):
                     system_prompt = gr.Textbox(
                         value=(
-                            "Answer clinically and concisely using the provided context. "
-                            "If context is insufficient, state what is missing. Cite filenames in brackets when used. "
-                            "Use plain text only - no tables or complex Markdown formatting. Keep responses brief and focused."
+                            "Answer clinically and concisely using provided context. "
+                            "If context insufficient, state what's missing. Cite filenames in brackets. "
+                            "Plain text only - no tables/Markdown. Be brief and focused."
                         ),
                         label="System Prompt",
                         lines=3
