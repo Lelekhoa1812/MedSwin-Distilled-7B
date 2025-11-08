@@ -316,18 +316,18 @@ def _build_fallback_chat_prompt(messages, include_history: bool = True, max_hist
     
     # Only include history if explicitly requested and if it's relevant
     if include_history:
-    history_pairs = []
-    current_q = None
-    for m in messages:
-        role = m.get("role")
-        content = (m.get("content", "") or "").strip()
-        if role == "user":
-            current_q = content
-        elif role == "assistant" and current_q:
+        history_pairs = []
+        current_q = None
+        for m in messages:
+            role = m.get("role")
+            content = (m.get("content", "") or "").strip()
+            if role == "user":
+                current_q = content
+            elif role == "assistant" and current_q:
                 # Only include complete QA pairs with substantial content
                 if len(current_q.strip()) > 10 and len(content.strip()) > 10:
-            history_pairs.append((current_q, content))
-            current_q = None
+                    history_pairs.append((current_q, content))
+                current_q = None
 
         # Only include recent, relevant history (default: last 1 pair, max 2)
         if history_pairs:
@@ -335,7 +335,7 @@ def _build_fallback_chat_prompt(messages, include_history: bool = True, max_hist
             # Only include if the last question is different from current question
             if recent_pairs and recent_pairs[-1][0] != last_user:
                 history_text = "\n".join([f"Q: {q}\nA: {a}" for q, a in recent_pairs])
-        instruction += f"\n\nContext Conversation (for background):\n{history_text}"
+                instruction += f"\n\nContext Conversation (for background):\n{history_text}"
     
     if last_user:
         instruction += f"\n\nTask: Answer the user's question.\nQuestion: {last_user}"
