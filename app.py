@@ -415,7 +415,7 @@ def _load_model_and_tokenizer(model_name: str):
     for attempt in range(max_retries):
         try:
             logger.info(f"Loading tokenizer for {model_name} (attempt {attempt + 1}/{max_retries})")
-        tok = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN)
+            tok = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN)
             break
         except (OSError, PermissionError, Exception) as e:
             error_str = str(e).lower()
@@ -457,9 +457,9 @@ def _load_model_and_tokenizer(model_name: str):
                 continue
             else:
                 # Try slow tokenizer as last resort
-        logger.warning(f"Fast tokenizer load failed ({e}). Retrying with slow tokenizer...")
+                logger.warning(f"Fast tokenizer load failed ({e}). Retrying with slow tokenizer...")
                 try:
-        tok = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN, use_fast=False)
+                    tok = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN, use_fast=False)
                     break
                 except Exception as e2:
                     raise
@@ -484,14 +484,14 @@ def _load_model_and_tokenizer(model_name: str):
     for attempt in range(max_retries):
         try:
             logger.info(f"Loading model for {model_name} (attempt {attempt + 1}/{max_retries})")
-    mdl = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",
-        trust_remote_code=True,
-        token=HF_TOKEN,
-        dtype=dtype,
-        low_cpu_mem_usage=True,
-    )
+            mdl = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                device_map="auto",
+                trust_remote_code=True,
+                token=HF_TOKEN,
+                dtype=dtype,
+                low_cpu_mem_usage=True,
+            )
             break
         except (OSError, PermissionError, Exception) as e:
             error_str = str(e).lower()
