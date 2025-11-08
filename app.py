@@ -1595,27 +1595,27 @@ def _stream_chat_impl(
         else:
             # Start generation in a separate thread
             generation_start_time = time.time()
-    thread = threading.Thread(target=global_model.generate, kwargs=generation_kwargs)
-    thread.start()
+            thread = threading.Thread(target=global_model.generate, kwargs=generation_kwargs)
+            thread.start()
             logger.info(f"Generation thread started at {generation_start_time}")
 
-    # prime UI
-    updated_history = (history or []) + [{"role": "user", "content": message}, {"role": "assistant", "content": ""}]
+            # prime UI
+            updated_history = (history or []) + [{"role": "user", "content": message}, {"role": "assistant", "content": ""}]
             model_status = "Model is generating initial answer..."
             yield updated_history, model_status
 
-    partial_response = ""
+            partial_response = ""
             skip_initial_generation = False
             
-    first_token_received = threading.Event()
+        first_token_received = threading.Event()
 
     def _watch_first_token():
         if not first_token_received.wait(timeout=45):
             logger.warning("Generation timeout: no tokens in 45s; stopping stream.")
             stop_event.set()
 
-    watchdog = threading.Thread(target=_watch_first_token, daemon=True)
-    watchdog.start()
+            watchdog = threading.Thread(target=_watch_first_token, daemon=True)
+            watchdog.start()
 
             # Wait for generation to complete properly
             # The streamer might stop yielding before generation completes, so we need to ensure
@@ -1628,10 +1628,10 @@ def _stream_chat_impl(
             if chunk and not first_token_received.is_set():
                 first_token_received.set()
                 if chunk:
-            partial_response += chunk
+                    partial_response += chunk
                     chunk_count += 1
                     last_chunk_time = time.time()
-            updated_history[-1]["content"] = partial_response
+                    updated_history[-1]["content"] = partial_response
                     model_status = "Model is generating initial answer..."
                     
                     # Save cache periodically (every 50 chunks to avoid overhead)
